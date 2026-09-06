@@ -13,11 +13,11 @@ import {
   send,
   stream,
   type CallOptions,
-  type Frame,
-  type ListenOptions,
   type Port,
+  type Frame,
   type RecvMsg,
   type SendMsg,
+  type Source,
   type Unsub,
   type Validate,
 } from './index.ts'
@@ -56,7 +56,7 @@ const api = pair('api', {
   shortStream: stream<string, Row>(),
 })
 
-const transport: Port<Frame, Frame> = {
+const transport: Port.Port<Frame, Frame> = {
   send: () => {},
   listen: () => () => {},
 }
@@ -92,9 +92,9 @@ r.watch
 
 // --- inbound listeners ------------------------------------------------------
 
-expect<typeof r.on.log>().is<(fn: (incoming: string) => void, opts?: ListenOptions) => Unsub>()
-expect<typeof l.on.push>().is<(fn: (incoming: ServerEvent) => void, opts?: ListenOptions) => Unsub>()
-expect<typeof l.on.ready>().is<(fn: (incoming: void) => void, opts?: ListenOptions) => Unsub>()
+expect<typeof r.on.log>().is<(fn: (incoming: string) => void, opts?: Port.ListenOptions) => Unsub>()
+expect<typeof l.on.push>().is<(fn: (incoming: ServerEvent) => void, opts?: Port.ListenOptions) => Unsub>()
+expect<typeof l.on.ready>().is<(fn: (incoming: void) => void, opts?: Port.ListenOptions) => Unsub>()
 
 // a request carries the means to answer it, and a signal for when the asker leaves
 expect<typeof r.on.getUser>().is<
@@ -105,7 +105,7 @@ expect<typeof r.on.getUser>().is<
       fail: (error: unknown) => void
       signal: AbortSignal
     }) => void,
-    opts?: ListenOptions,
+    opts?: Port.ListenOptions,
   ) => Unsub
 >()
 
@@ -118,7 +118,7 @@ expect<typeof r.on.watch>().is<
       fail: (error: unknown) => void
       signal: AbortSignal
     }) => void,
-    opts?: ListenOptions,
+    opts?: Port.ListenOptions,
   ) => Unsub
 >()
 
@@ -160,6 +160,33 @@ const text = pair('text', { lines: send<void>().stream<string>() })
 // @ts-expect-error a bare string is iterable, but it is not a stream of strings
 text.right(transport).serve({ lines: () => 'abc' })
 
+// --- streaming from a push source -------------------------------------------
+
+// a streaming handler may return a subscribe function instead of an iterable
+r.serve({ watch: () => (next, close) => (next({ n: 1 }), close(), () => {}) })
+r.serve({ watch: async () => (next) => topic.listen((f) => next({ n: Number(f.kind) })) })
+r.serve({
+  watch: () => (next) => {
+    expect<typeof next>().is<(value: Row) => void>()
+    return () => {}
+  },
+})
+
+// a port's listener is one: `onClose(error?)` is exactly `close`
+const rowPort: Port.Port<never, Row> = {} as any
+r.serve({ watch: () => (next, close) => rowPort.listen(next, { onClose: close }) })
+
+// @ts-expect-error the source must push what the stream declares
+r.serve({ watch: () => (next: (v: string) => void) => () => void next })
+
+// @ts-expect-error a source must return its teardown
+r.serve({ watch: () => () => 'not an unsub' })
+
+// @ts-expect-error the handler returns a source; it is not itself one
+r.serve({ watch: (next: (v: Row) => void) => () => void next })
+
+expect<Source<Row>>().is<(next: (value: Row) => void, close: (error?: unknown) => void) => Unsub>()
+
 // --- calls and options ------------------------------------------------------
 
 void l.getUser({ id: '1' }, { signal: new AbortController().signal })
@@ -182,7 +209,7 @@ void consume
 
 // --- a side is a port; links and topics are ports ---------------------------
 
-const _asPort: Port<SendMsg<typeof api.spec, 'l'>, RecvMsg<typeof api.spec, 'l'>> = l
+const _asPort: Port.Port<SendMsg<typeof api.spec, 'l'>, RecvMsg<typeof api.spec, 'l'>> = l
 void _asPort
 
 const link: ILink<Frame> = {} as any
@@ -286,7 +313,7 @@ expect<typeof p1.ping>().is<(opts?: CallOptions) => Promise<number>>()
 expect<typeof p1.history>().is<(payload: { q: string }, opts?: CallOptions) => AsyncIterableIterator<Row>>()
 
 // and receives everything it can send
-expect<typeof p1.on.chat>().is<(fn: (incoming: string) => void, opts?: ListenOptions) => Unsub>()
+expect<typeof p1.on.chat>().is<(fn: (incoming: string) => void, opts?: Port.ListenOptions) => Unsub>()
 expect<typeof p1.on.ping>().is<
   (
     fn: (incoming: {
@@ -295,7 +322,7 @@ expect<typeof p1.on.ping>().is<
       fail: (error: unknown) => void
       signal: AbortSignal
     }) => void,
-    opts?: ListenOptions,
+    opts?: Port.ListenOptions,
   ) => Unsub
 >()
 
@@ -328,7 +355,7 @@ try {
 } catch {}
 
 // a channel is a port, renames, and mounts alongside protocols
-const _peerAsPort: Port<SendMsg<typeof room.spec, 'l'>, RecvMsg<typeof room.spec, 'l'>> = p1
+const _peerAsPort: Port.Port<SendMsg<typeof room.spec, 'l'>, RecvMsg<typeof room.spec, 'l'>> = p1
 void _peerAsPort
 expect<ReturnType<ReturnType<typeof room.at>['connect']>>().is<typeof p1>()
 

@@ -384,6 +384,7 @@ export const handshake = <T>(target: Link.Events, opts: Handshake.Options = {}):
       (event) => {
         const got = claim(opts, allowed, event)
         if (!got) return
+
         onLink(
           link<T>(got.port, {
             ...opts,

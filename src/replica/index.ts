@@ -1,5 +1,5 @@
 import { emitter, noop, repeat, type Emitter } from '../core/internal.ts'
-import type { ListenOptions, Port, Unsub } from '../index.ts'
+import type { Port, Unsub } from '../index.ts'
 import { systemClock, type Clock } from '../core/index.ts'
 
 /**
@@ -33,9 +33,9 @@ export interface Replica<S, T extends Replica.Type> {
    * `get()` for the current value. `onClose` fires when the replica closes,
    * with the error if it failed.
    */
-  listen(fn: (state: S) => void, opts?: ListenOptions): Unsub
+  listen(fn: (state: S) => void, opts?: Port.ListenOptions): Unsub
   /** Fires on each status transition. */
-  onStatus(fn: (status: Replica.Status) => void, opts?: ListenOptions): Unsub
+  onStatus(fn: (status: Replica.Status) => void, opts?: Port.ListenOptions): Unsub
   close(): void
 }
 
@@ -195,12 +195,12 @@ export declare namespace Replica {
 }
 
 type Factories<S, U> = {
-  r: (ch: Port<Replica.Message<S, U>>, id?: string) => Replica.Reader<S>
-  w: (ch: Port<Replica.Message<S, U>>, id?: string) => Replica.Writer<S, U>
+  r: (ch: Port.Port<Replica.Message<S, U>>, id?: string) => Replica.Reader<S>
+  w: (ch: Port.Port<Replica.Message<S, U>>, id?: string) => Replica.Writer<S, U>
 }
 
 type MergingFactories<S, U> = Factories<S, U> & {
-  rw: (ch: Port<Replica.Message<S, U>>, id?: string) => Replica.ReaderWriter<S, U>
+  rw: (ch: Port.Port<Replica.Message<S, U>>, id?: string) => Replica.ReaderWriter<S, U>
 }
 
 /**
@@ -235,7 +235,7 @@ export function define<S, U>(def: Omit<Replica.Def<S, U>, 'id'>): MergingFactori
  * {@link Replica.GapPolicy}. It produces nothing of its own and never answers
  * requests.
  */
-export const reader = <S, U>(def: Replica.Def<S, U>, ch: Port<Replica.Message<S, U>>): Replica.Reader<S> =>
+export const reader = <S, U>(def: Replica.Def<S, U>, ch: Port.Port<Replica.Message<S, U>>): Replica.Reader<S> =>
   sync(def, ch, { follow: true, serve: false }).view('R')
 
 /**
@@ -243,7 +243,7 @@ export const reader = <S, U>(def: Replica.Def<S, U>, ch: Port<Replica.Message<S,
  * them, and answers `req` with a snapshot. It never accepts remote updates, so
  * it is never stale. Do not mix with other writing replicas on one port.
  */
-export const writer = <S, U>(def: Replica.Def<S, U>, ch: Port<Replica.Message<S, U>>): Replica.Writer<S, U> => {
+export const writer = <S, U>(def: Replica.Def<S, U>, ch: Port.Port<Replica.Message<S, U>>): Replica.Writer<S, U> => {
   const { view, update } = sync(def, ch, { follow: false, serve: true })
   // Assigned onto, not spread: spreading would read the live getters once.
   return Object.assign(view('W'), { update })
@@ -262,7 +262,7 @@ export const writer = <S, U>(def: Replica.Def<S, U>, ch: Port<Replica.Message<S,
  */
 export const readerWriter = <S, U>(
   def: Replica.MergeDef<S, U>,
-  ch: Port<Replica.Message<S, U>>,
+  ch: Port.Port<Replica.Message<S, U>>,
 ): Replica.ReaderWriter<S, U> => {
   const { view, update } = sync(def, ch, { follow: true, serve: true })
   return Object.assign(view('RW'), { update })
@@ -294,7 +294,7 @@ const rid = (): string => {
  */
 const sync = <S, U>(
   def: Replica.Def<S, U>,
-  ch: Port<Replica.Message<S, U>>,
+  ch: Port.Port<Replica.Message<S, U>>,
   opts: { follow: boolean; serve: boolean },
 ) => {
   const id = def.id ?? rid()
@@ -614,7 +614,7 @@ const sync = <S, U>(
   }
 
   /** Shared by `listen` and `onStatus`: a subscription whose `onClose` is the replica's end. */
-  const on = <A extends unknown[]>(em: Emitter<A>, fn: (...a: A) => void, o: ListenOptions = {}): Unsub => {
+  const on = <A extends unknown[]>(em: Emitter<A>, fn: (...a: A) => void, o: Port.ListenOptions = {}): Unsub => {
     if (closed) {
       o.onClose?.(error)
       return noop

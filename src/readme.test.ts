@@ -10,7 +10,7 @@ import { describe, expect, it } from 'vitest'
 import { bridge, connector, fromWindow, handshake, link, worker, type Link } from './adapter/browser.ts'
 import { define, Hub, Session, pair as linkPair, persistent } from './index.ts'
 import * as replica from './replica/index.ts'
-import { both, symmetric, pair, recv, send, stream, type Frame } from './rpc/index.ts'
+import { both, pair, recv, send, stream, symmetric, type Frame } from './rpc/index.ts'
 import { fakeClock } from './bus/testing.ts'
 
 const settled = () => new Promise<void>((r) => setTimeout(r, 0))
@@ -74,7 +74,30 @@ describe('README', () => {
     hub.close()
   })
 
-  it('RPC: a symmetric channel, one kind of end', async () => {
+  it('RPC: streaming from a push source', async () => {
+    const feed = pair('feed', { watch: send<{ q: string }>().stream<number>() })
+    const [pa, pb] = linkPair<Frame>()
+    const [upstream, source] = linkPair<number>()
+
+    // a port, a topic or a link is already a source: `onClose(error?)` is `close`
+    feed
+      .right(pb)
+      .serve({
+        watch: () => (next: (value: number) => void, close: () => void) => source.listen(next, { onClose: close }),
+      })
+
+    const it = feed.left(pa).watch({ q: 'x' })
+    const first = it.next()
+    await settled()
+    upstream.send(1)
+    expect(await first).toEqual({ value: 1, done: false })
+
+    upstream.close() // completes the stream
+    expect(await it.next()).toEqual({ value: undefined, done: true })
+    pa.close()
+  })
+
+  it('RPC: a symmetric protocol, one kind of end', async () => {
     const room = symmetric('room', {
       chat: both<string>(),
       ping: both<void>().reply<number>(),

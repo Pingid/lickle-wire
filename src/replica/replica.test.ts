@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { define, reader, readerWriter, writer, type Replica } from './index.ts'
-import type { ListenOptions, Port } from '../index.ts'
 import { fakeClock, type FakeClock } from '../bus/testing.ts'
+import type { Port } from '../index.ts'
 
 // --- harness ----------------------------------------------------------------
 
@@ -44,7 +44,7 @@ const mesh = <M>() => {
       }
       origin.clear()
     },
-    port: (): Port<M> & { fail(e: unknown): void; end(): void } => {
+    port: (): Port.Port<M> & { fail(e: unknown): void; end(): void } => {
       const node: Node = { listeners: new Set(), closed: null }
       nodes.push(node)
       const close = (error?: unknown) => {
@@ -65,7 +65,7 @@ const mesh = <M>() => {
           }
           fanout(node, msg)
         },
-        listen: (next, opts: ListenOptions = {}) => {
+        listen: (next, opts: Port.ListenOptions = {}) => {
           if (node.closed) {
             opts.onClose?.(node.closed.error)
             return () => {}

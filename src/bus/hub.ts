@@ -1,5 +1,5 @@
 import { attempt, emitter, isPromise, noop, report, validateSync, type Emitter } from '../core/internal.ts'
-import type { ListenOptions, Unsub } from '../index.ts'
+import type { Port, Unsub } from '../index.ts'
 import { pair, type ILink } from './link/index.ts'
 import * as Protocol from './protocol.ts'
 import { Session } from './session.ts'
@@ -144,7 +144,7 @@ export class Hub<T extends Protocol.Topics = Protocol.Topics> {
     return e && e.live ? e.peer : null
   }
 
-  onPeersChange(fn: (peers: readonly Hub.Peer<T>[]) => void, opts: ListenOptions = {}): Unsub {
+  onPeersChange(fn: (peers: readonly Hub.Peer<T>[]) => void, opts: Port.ListenOptions = {}): Unsub {
     if (this.#closed) {
       opts.onClose?.()
       return noop
@@ -296,7 +296,7 @@ export class Hub<T extends Protocol.Topics = Protocol.Topics> {
     this.#watchers.clear()
   }
 
-  #withEnd(off: Unsub, opts: ListenOptions): Unsub {
+  #withEnd(off: Unsub, opts: Port.ListenOptions): Unsub {
     const onClose = opts.onClose
     if (!onClose) return off
     const offGone = this.#gone.add(() => onClose(), opts.signal)

@@ -1,4 +1,4 @@
-import type { ListenOptions, Port, Unsub } from '../../core/index.ts'
+import type { Port, Unsub } from '../../core/index.ts'
 
 export * from './persistent.ts'
 export * from './pair.ts'
@@ -16,7 +16,7 @@ export * from './pair.ts'
  *
  */
 
-export interface ILink<T = unknown> extends Port<T, T> {
+export interface ILink<T = unknown> extends Port.Port<T, T> {
   /** Label for the far end. Adapter-defined, not unique, for logs and policy. */
   readonly remote: string
   /**
@@ -34,13 +34,13 @@ export interface ILink<T = unknown> extends Port<T, T> {
    * teardown, so a caller can hang the whole tree off one `AbortSignal`
    * instead of collecting arrays of closures.
    */
-  changed(fn: (up: boolean) => void, opts?: ListenOptions): Unsub
+  changed(fn: (up: boolean) => void, opts?: Port.ListenOptions): Unsub
   /** Never throws. Returns false if the message was dropped. */
   send(msg: T): boolean
   /** Inbound messages that arrive before the first listener are buffered. */
-  listen(fn: (msg: T) => void, opts?: ListenOptions): Unsub
+  listen(fn: (msg: T) => void, opts?: Port.ListenOptions): Unsub
   /** Terminal. Fires immediately if the link is already closed. */
-  closed(fn: () => void, opts?: ListenOptions): Unsub
+  closed(fn: () => void, opts?: Port.ListenOptions): Unsub
   close(): void
 }
 

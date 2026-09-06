@@ -129,7 +129,7 @@ without adapters. Anything you build that satisfies the interface plugs in the s
 
 ### Link
 
-Layer 0: one end of an open duplex channel, with reconnection.
+Layer 0: one end of an open duplex symmetric, with reconnection.
 
 ```ts
 import { Link } from '@lickle/wire'
@@ -174,7 +174,7 @@ for await (const n of tick.stream({ signal })) {
 tick.send(3)
 tick.send(3, { to: peerId }) // one peer only, bypassing subscriptions
 
-const rr = session.topic('req', 'res') // publish on one channel, listen on another
+const rr = session.topic('req', 'res') // publish on one symmetric, listen on another
 const direct = tick.peer(peerId) // a Port that only talks to one peer
 
 session.on('open' | 'close' | 'error', fn)
@@ -207,7 +207,7 @@ const hub = app.hub({
   policy: {
     canAccept: async (peer) => verify(peer.meta), // frames are held until this settles
     canSubscribe: (peer, channel) => true,
-    canPublish: (peer, channel, payload) => true,
+    canPublish: (peer, symmetric, payload) => true,
     canAddress: (from, to, channel) => true,
   },
 })
@@ -289,10 +289,33 @@ r.on.watch(({ payload, next, end, fail, signal }) => {
 })
 ```
 
+### Streaming from a push source
+
+A streaming handler returns anything iterable — an array, a generator, an `async function*`. When the thing
+you are streaming pushes instead of being pulled, return a subscribe function and it is driven for you:
+
+```ts
+r.serve({
+  watch: (q) => (next, close) => subscribe(q, next, close), // returns the teardown
+})
+```
+
+The shape is a port's `listen`: push with `next`, report the end through `close` — an error when it failed,
+nothing when it completed — and return the teardown, which runs when the requester stops, when the stream
+ends, or when the transport closes. So a port, a topic or a link is already a source:
+
+```ts
+r.serve({ watch: () => (next, close) => topic.listen(next, { onClose: close }) })
+```
+
+A source may push and close synchronously from inside the subscribe call; its teardown still runs. Values
+pushed after the requester has gone are dropped rather than sent, and a source that never closes streams
+until the requester stops.
+
 ### Symmetric channels
 
 When both ends run the same code — two workers, two frames, two peers — there is no left and right to
-choose between. `channel()` takes a spec where every message is declared with `both()` and hands back one
+choose between. `symmetric()` takes a spec where every message is declared with `both()` and hands back one
 constructor instead of two:
 
 ```ts
@@ -315,8 +338,8 @@ await a.ping()
 ```
 
 `connect` is the whole difference. The wire format, `on`, `serve`, cancellation, validation, `at()`,
-`with()` and `mount()` are the same as a pair's — a symmetric is just a pair whose two sides coincide.
-`send()` or `recv()` in a symmetric spec is an error on that key, at compile time and at runtime.
+`with()` and `mount()` are the same as a pair's — a symmetric protocol is a pair whose two sides coincide.
+`send()` or `recv()` in that spec is an error on the offending key, at compile time and at runtime.
 
 Correlation ids are per-instance, so two peers calling at the same moment both use `1` without colliding: a
 reply only ever travels back to the end that asked.
@@ -400,7 +423,7 @@ Errors cross as `{ name, message }` and are rehydrated into an `Error`, so they 
 ### Caveats
 
 - **Reserved names.** A message cannot be called `send`, `listen`, `on`, `serve` or `then`; `pair()` and
-  `channel()` reject those at compile time and at runtime.
+  `symmetric()` reject those at compile time and at runtime.
 - **Streams are lazy and single-use.** `const it = l.watch(q)` sends nothing until the first pull, and a
   second `for await` over the same iterator is already done. Values arriving faster than they are pulled
   are buffered without bound.
@@ -488,7 +511,7 @@ Origins are required, never `'*'` — defaulting would hand a live `MessagePort`
 | Import                 | Contents                                                                       |
 | ---------------------- | ------------------------------------------------------------------------------ |
 | `@lickle/wire`         | `Port`, `Hub`, `Session`, `define`, `pair`, `persistent`, `ILink`, `fakeClock` |
-| `@lickle/wire/rpc`     | `pair`, `channel`, `send`, `recv`, `both`, `stream`, `mount`, `Frame`          |
+| `@lickle/wire/rpc`     | `pair`, `symmetric`, `send`, `recv`, `both`, `stream`, `mount`, `Frame`        |
 | `@lickle/wire/replica` | `define`, `reader`, `writer`, `readerWriter`, `Replica`                        |
 | `@lickle/wire/browser` | `link`, `worker`, `connector`, `handshake`, `bridge`, `fromWindow`             |
 

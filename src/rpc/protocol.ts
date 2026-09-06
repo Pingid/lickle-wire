@@ -1,5 +1,5 @@
 import { noop, queue, report } from '../core/internal.ts'
-import type { ListenOptions, Port, Unsub } from '../core/index.ts'
+import type { Port, Unsub } from '../core/index.ts'
 import { validateSync, type Validate } from '../core/validate.ts'
 import type {
   Api,
@@ -16,6 +16,7 @@ import type {
   RecvMsg,
   Reserved,
   SendMsg,
+  Source,
   Spec,
   Subscription,
   CallOptions,
@@ -76,7 +77,7 @@ export interface Options {
  * One side of a protocol: a {@link Port} at the message level, plus the
  * generated call surface, per-message inbound listeners, and `serve`.
  */
-export type Sided<T extends Spec, D extends Dir> = Port<SendMsg<T, D>, RecvMsg<T, D>> &
+export type Sided<T extends Spec, D extends Dir> = Port.Port<SendMsg<T, D>, RecvMsg<T, D>> &
   Api<T, D> & {
     /** Per-message inbound listeners, carrying the means to respond. */
     on: On<T, D>
@@ -93,8 +94,8 @@ export type Peer<T extends Spec> = Sided<T, 'l'>
 export interface Protocol<T extends Spec, Wire = Frame> {
   readonly name: string
   readonly spec: T
-  left: (transport: Port<Wire, Wire>) => Sided<T, 'l'>
-  right: (transport: Port<Wire, Wire>) => Sided<T, 'r'>
+  left: (transport: Port.Port<Wire, Wire>) => Sided<T, 'l'>
+  right: (transport: Port.Port<Wire, Wire>) => Sided<T, 'r'>
   /** Re-frame through an outer codec. Composes; it does not replace. */
   with: <Outer>(codec: Codec<Outer, Wire>) => Protocol<T, Outer>
   /** Rename, so the same protocol can be mounted twice on one transport. */
@@ -134,7 +135,7 @@ export interface Channel<T extends Spec, Wire = Frame> {
   readonly name: string
   readonly spec: T
   /** Attach an instance. There is only one constructor because both ends are alike. */
-  connect: (transport: Port<Wire, Wire>) => Peer<T>
+  connect: (transport: Port.Port<Wire, Wire>) => Peer<T>
   /** Re-frame through an outer codec. Composes; it does not replace. */
   with: <Outer>(codec: Codec<Outer, Wire>) => Channel<T, Outer>
   /** Rename, so the same channel can be mounted twice on one transport. */
@@ -202,8 +203,8 @@ const build = <T extends Spec, W>(
   return {
     name,
     spec,
-    left: (transport) => adapt(spec, 'l', codecFor('l'), transport as unknown as Port<Frame, Frame>, options),
-    right: (transport) => adapt(spec, 'r', codecFor('r'), transport as unknown as Port<Frame, Frame>, options),
+    left: (transport) => adapt(spec, 'l', codecFor('l'), transport as unknown as Port.Port<Frame, Frame>, options),
+    right: (transport) => adapt(spec, 'r', codecFor('r'), transport as unknown as Port.Port<Frame, Frame>, options),
     with: <Outer>(codec: Codec<Outer, W>) =>
       build<T, Outer>(name, spec, options, outer ? compose(codec, outer) : codec),
     at: (renamed) => build<T, W>(renamed, spec, options, outer),
@@ -329,7 +330,7 @@ const adapt = <T extends Spec, D extends Dir>(
   spec: T,
   side: D,
   codec: Codec<any>,
-  transport: Port<Frame, Frame>,
+  transport: Port.Port<Frame, Frame>,
   options: Options,
 ): Sided<T, D> => {
   const send = (msg: AnyMsg) => transport.send(codec.encode(msg))
@@ -436,7 +437,7 @@ const adapt = <T extends Spec, D extends Dir>(
   const subscribe = (
     set: Set<Listener>,
     sink: (v: unknown) => void,
-    opts: ListenOptions,
+    opts: Port.ListenOptions,
     onEmpty?: () => void,
   ): Unsub => {
     if (opts.signal?.aborted) return noop
@@ -462,7 +463,7 @@ const adapt = <T extends Spec, D extends Dir>(
 
   const on =
     (kind: string) =>
-    (fn: (incoming: unknown) => void, opts: ListenOptions = {}): Unsub => {
+    (fn: (incoming: unknown) => void, opts: Port.ListenOptions = {}): Unsub => {
       let set = listeners.get(kind)
       if (!set) listeners.set(kind, (set = new Set()))
       const mine = set
@@ -471,7 +472,7 @@ const adapt = <T extends Spec, D extends Dir>(
       })
     }
 
-  const listen = (next: (value: unknown) => void, opts: ListenOptions = {}): Unsub => subscribe(raw, next, opts)
+  const listen = (next: (value: unknown) => void, opts: Port.ListenOptions = {}): Unsub => subscribe(raw, next, opts)
 
   /** Build what an `on.X` listener receives: the payload, and for requests the means to answer. */
   const wrap = (kind: string, mode: Mode, msg: AnyMsg): unknown => {
@@ -736,6 +737,15 @@ const iterate = (source: unknown): AnyIterator => {
   throw new TypeError('a streaming handler must return an AsyncIterable or an Iterable')
 }
 
+/** A teardown that throws must not escape into whatever aborted the request. */
+const detach = (off: Unsub) => {
+  try {
+    off()
+  } catch {
+    // a teardown that threw
+  }
+}
+
 const retire = (it: AnyIterator) => {
   try {
     void Promise.resolve(it.return?.()).catch(noop)
@@ -744,23 +754,39 @@ const retire = (it: AnyIterator) => {
   }
 }
 
+/**
+ * Resolves what the handler returned, then hands it to the driver that suits
+ * it. A function is a {@link Source} to subscribe to; anything else is iterated.
+ */
 const pump = async (inc: Subscription<unknown, unknown>, handler: Handler) => {
   if (inc.signal.aborted) return
-  let it: AnyIterator | null = null
-  // Synchronous on purpose: at abort time `it` is either still null — the
-  // handler is running, and the check after it picks the abort up — or set, and
-  // retired here. A deferred listener could run after that check and retire twice.
-  const onAbort = () => {
-    if (it) retire(it)
+  let source: unknown
+  try {
+    source = await handler(inc.payload, { signal: inc.signal })
+  } catch (e) {
+    if (!inc.signal.aborted) inc.fail(e)
+    return
   }
+  // Nothing has been started yet, so an abort while the handler ran needs no
+  // teardown. Every driver below registers its own listener from here on with
+  // no await in between, so a `stop` cannot slip through the gap.
+  if (inc.signal.aborted) return
+  if (typeof source === 'function') return drive(inc, source as Source<unknown>)
+  return drain(inc, source)
+}
+
+/** Pulls an iterable dry, one value per pull, until it ends or the requester leaves. */
+const drain = async (inc: Subscription<unknown, unknown>, source: unknown) => {
+  let it: AnyIterator
+  try {
+    it = iterate(source)
+  } catch (e) {
+    inc.fail(e)
+    return
+  }
+  const onAbort = () => retire(it)
   inc.signal.addEventListener('abort', onAbort, { once: true })
   try {
-    const source = await handler(inc.payload, { signal: inc.signal })
-    it = iterate(source)
-    if (inc.signal.aborted) {
-      retire(it)
-      return
-    }
     for (;;) {
       const r = await it.next()
       // A value that landed after `stop`: `onAbort` has already queued `return()`.
@@ -776,6 +802,45 @@ const pump = async (inc: Subscription<unknown, unknown>, handler: Handler) => {
     if (!inc.signal.aborted) inc.fail(e)
   } finally {
     inc.signal.removeEventListener('abort', onAbort)
+  }
+}
+
+/**
+ * Subscribes to a push source and forwards what it pushes.
+ *
+ * A source may deliver — and close — synchronously from inside the subscribe
+ * call, before its teardown is in hand, so teardown is recorded rather than run
+ * and performed once there is something to run.
+ */
+const drive = (inc: Subscription<unknown, unknown>, source: Source<unknown>) => {
+  let off: Unsub | null = null
+  let live = true
+  const release = () => {
+    if (!live) return
+    live = false
+    inc.signal.removeEventListener('abort', onAbort)
+    if (off) detach(off)
+  }
+  const onAbort = () => release()
+  inc.signal.addEventListener('abort', onAbort, { once: true })
+  try {
+    off = source(
+      (value) => {
+        if (live) inc.next(value)
+      },
+      (error) => {
+        if (!live) return
+        release()
+        if (error === undefined) inc.end()
+        else inc.fail(error)
+      },
+    )
+    // It closed, or the requester left, before `off` existed.
+    if (!live) detach(off)
+  } catch (e) {
+    release()
+    // A throw after abort is the source reacting to its teardown.
+    if (!inc.signal.aborted) inc.fail(e)
   }
 }
 
@@ -799,7 +864,7 @@ export type Mounted<Ps extends Record<string, Mountable>, D extends Dir> = {
 }
 
 /** A channel has one end, so `left` and `right` hand back the same thing. */
-const instance = (p: Mountable, side: 'left' | 'right', transport: Port<any, any>) =>
+const instance = (p: Mountable, side: 'left' | 'right', transport: Port.Port<any, any>) =>
   'connect' in p ? p.connect(transport) : p[side](transport)
 
 /**
@@ -815,11 +880,11 @@ const instance = (p: Mountable, side: 'left' | 'right', transport: Port<any, any
  * ```
  */
 export const mount = <Ps extends Record<string, Mountable>>(protocols: Ps) => ({
-  left: (transport: Port<any, any>) =>
+  left: (transport: Port.Port<any, any>) =>
     Object.fromEntries(
       Object.entries(protocols).map(([k, p]) => [k, instance(p, 'left', transport)]),
     ) as unknown as Mounted<Ps, 'l'>,
-  right: (transport: Port<any, any>) =>
+  right: (transport: Port.Port<any, any>) =>
     Object.fromEntries(
       Object.entries(protocols).map(([k, p]) => [k, instance(p, 'right', transport)]),
     ) as unknown as Mounted<Ps, 'r'>,

@@ -1,4 +1,4 @@
-import type { ListenOptions, Unsub } from '../index.ts'
+import type { Port, Unsub } from '../index.ts'
 import type { Validate } from '../core/validate.ts'
 
 // ---------------------------------------------------------------------------
@@ -87,12 +87,6 @@ export const stream = <Q = void, R = void>() => send<Q>().stream<R>()
 /** A protocol: one flat map of message name to descriptor. */
 export type Spec = Record<string, Desc>
 
-/**
- * A {@link Spec} in which every message may travel either way, so both ends of
- * it are identical. What {@link channel} takes.
- */
-export type Symmetric = Record<string, Desc<'b'>>
-
 // ---------------------------------------------------------------------------
 // Reserved names
 //
@@ -113,8 +107,8 @@ export type CheckKeys<T> =
 type OneWay<T> = { [K in keyof T]: T[K] extends Desc<infer D> ? ('b' extends D ? never : K) : K }[keyof T]
 
 /**
- * Every end of a channel is the same end, so a one-directional message has no
- * meaning there. This surfaces as an error on the offending key.
+ * Every end of a {@link symmetric} channel is the same end, so a one-directional
+ * message has no meaning there. This surfaces as an error on the offending key.
  */
 export type CheckDirs<T> =
   OneWay<T> extends never
@@ -216,7 +210,7 @@ export type Incoming<T extends Spec, K extends keyof T> = T[K]['mode'] extends '
 
 /** Per-message inbound listeners. Each returns a teardown. */
 export type On<T extends Spec, D extends Dir> = {
-  [K in Recvs<T, D>]: (fn: (incoming: Incoming<T, K>) => void, opts?: ListenOptions) => Unsub
+  [K in Recvs<T, D>]: (fn: (incoming: Incoming<T, K>) => void, opts?: Port.ListenOptions) => Unsub
 }
 
 /** What a handler is given besides the payload. */
@@ -226,11 +220,26 @@ export interface HandlerContext {
 }
 
 /**
+ * A push source, shaped like a port's `listen`: subscribe with `next`, report
+ * the end through `close` — an `error` when it failed, nothing when it
+ * completed — and return the teardown, which runs when the requester leaves.
+ *
+ * Handlers that ignore `close` stream until the requester stops.
+ *
+ * @example
+ * ```ts
+ * serve({ watch: () => (next, close) => topic.listen(next, { onClose: close }) })
+ * ```
+ */
+export type Source<R> = (next: (value: R) => void, close: (error?: unknown) => void) => Unsub
+
+/**
  * What a streaming handler returns: anything iterable, sync or async — an
- * array, a generator, an `async function*`. `& object` keeps a bare string
+ * array, a generator, an `async function*` — or a {@link Source} to subscribe
+ * to, for a push source that has no iterator. `& object` keeps a bare string
  * from passing as `Iterable<string>`.
  */
-export type Streamed<R> = (AsyncIterable<R> | Iterable<R>) & object
+export type Streamed<R> = ((AsyncIterable<R> | Iterable<R>) & object) | Source<R>
 
 export type Handlers<T extends Spec, D extends Dir> = {
   [K in Recvs<T, D>]?: T[K]['mode'] extends 'one'

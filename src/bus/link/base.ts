@@ -3,7 +3,7 @@
 /* -------------------------------------------------------------------------- */
 
 import { attempt, emitter, noop, report, type Emitter } from '../../core/internal.ts'
-import type { ListenOptions, Unsub } from '../../core/index.ts'
+import type { Port, Unsub } from '../../core/index.ts'
 import type { ILink } from './index.ts'
 
 export interface BaseLink<T> {
@@ -68,7 +68,7 @@ export const baseLink = <T>(o: BaseLink.Options<T>): BaseLink<T> => {
    * to the link's own terminal event. A link close is always clean — failures
    * surface through `onError` first and then manifest as a close.
    */
-  const on = <A extends unknown[]>(em: Emitter<A>, fn: (...a: A) => void, opts?: ListenOptions): Unsub => {
+  const on = <A extends unknown[]>(em: Emitter<A>, fn: (...a: A) => void, opts?: Port.ListenOptions): Unsub => {
     if (!alive) {
       opts?.onClose?.()
       return noop

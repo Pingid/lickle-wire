@@ -1,18 +1,29 @@
-import { both, symmetric, mount, pair, recv, send, type Frame, type Subscription, type Validate } from './index.js'
-import { Hub, pair as linkPair, type ILink, type ListenOptions, type Pair, type Port } from '../index.js'
+import {
+  both,
+  mount,
+  pair,
+  recv,
+  send,
+  symmetric,
+  type Frame,
+  type Source,
+  type Subscription,
+  type Validate,
+} from './index.js'
+import { Hub, pair as linkPair, type ILink, type Pair, type Port } from '../index.js'
 import { describe, expect, it, vi } from 'vitest'
 
 // --- harness ----------------------------------------------------------------
 
 /** Counts live `listen` calls on a port — the single-listener invariant made visible. */
-const probe = <S, R>(port: Port<S, R>) => {
+const probe = <S, R>(port: Port.Port<S, R>) => {
   let count = 0
   return {
     get count() {
       return count
     },
     send: (v: S) => port.send(v),
-    listen: (next: (v: R) => void, opts: ListenOptions = {}) => {
+    listen: (next: (v: R) => void, opts: Port.ListenOptions = {}) => {
       count++
       let done = false
       const leave = () => {
@@ -71,7 +82,7 @@ const manual = <T>() => {
     send: (v: T) => {
       sent.push(v)
     },
-    listen: (next: (v: T) => void, opts: ListenOptions = {}) => {
+    listen: (next: (v: T) => void, opts: Port.ListenOptions = {}) => {
       if (closed) {
         opts.onClose?.(closed.error)
         return () => {}
@@ -526,6 +537,173 @@ describe('streaming', () => {
   })
 })
 
+describe('streaming from a push source', () => {
+  /** A hand-driven push source, with its subscriber count visible. */
+  const pushable = () => {
+    type Sub = { next: (v: number) => void; close: (e?: unknown) => void }
+    const subs = new Set<Sub>()
+    return {
+      get subscribers() {
+        return subs.size
+      },
+      push: (v: number) => {
+        for (const s of [...subs]) s.next(v)
+      },
+      close: (e?: unknown) => {
+        for (const s of [...subs]) s.close(e)
+      },
+      source: (): Source<number> => (next, close) => {
+        const sub = { next, close }
+        subs.add(sub)
+        return () => subs.delete(sub)
+      },
+    }
+  }
+
+  it('forwards pushed values and completes on close()', async () => {
+    const t = wire()
+    const l = api.left(t.a)
+    const r = api.right(t.b)
+    const src = pushable()
+    r.serve({ watch: () => src.source() })
+
+    const got: number[] = []
+    const done = (async () => {
+      for await (const n of l.watch({ q: 'x' })) got.push(n)
+    })()
+    await settled()
+    expect(src.subscribers).toBe(1)
+
+    src.push(1)
+    src.push(2)
+    src.close()
+    await done
+
+    expect(got).toEqual([1, 2])
+    expect(src.subscribers).toBe(0)
+  })
+
+  it('fails the stream when the source closes with an error', async () => {
+    const t = wire()
+    const l = api.left(t.a)
+    const r = api.right(t.b)
+    const src = pushable()
+    r.serve({ watch: () => src.source() })
+
+    const it = l.watch({ q: 'x' })
+    const first = it.next()
+    await settled()
+    src.close(new Error('upstream gone'))
+
+    await expect(first).rejects.toThrow('upstream gone')
+    expect(src.subscribers).toBe(0)
+  })
+
+  it('unsubscribes when the requester stops', async () => {
+    const t = wire()
+    const l = api.left(t.a)
+    const r = api.right(t.b)
+    const src = pushable()
+    r.serve({ watch: () => src.source() })
+
+    const it = l.watch({ q: 'x' })
+    void it.next()
+    await settled()
+    expect(src.subscribers).toBe(1)
+
+    await it.return?.()
+    await settled()
+    expect(src.subscribers).toBe(0)
+    // Anything pushed afterwards is dropped rather than sent.
+    const toLeft = spy(t.rawA)
+    src.push(9)
+    await settled()
+    expect(toLeft).toEqual([])
+  })
+
+  it('unsubscribes when the transport closes under it', async () => {
+    const t = wire()
+    const l = api.left(t.a)
+    const r = api.right(t.b)
+    const src = pushable()
+    r.serve({ watch: () => src.source() })
+    const it = l.watch({ q: 'x' })
+    void it.next()
+    await settled()
+
+    t.rawA.close()
+    await settled()
+    expect(src.subscribers).toBe(0)
+  })
+
+  it('handles a source that pushes and closes synchronously, before its teardown exists', async () => {
+    const t = wire()
+    const l = api.left(t.a)
+    const r = api.right(t.b)
+    let torn = 0
+    r.serve({
+      watch: () => (next, close) => {
+        next(1)
+        next(2)
+        close()
+        return () => torn++
+      },
+    })
+
+    const got: number[] = []
+    for await (const n of l.watch({ q: 'x' })) got.push(n)
+    expect(got).toEqual([1, 2])
+    expect(torn).toBe(1)
+  })
+
+  it('swallows a teardown that throws rather than losing it into the abort', async () => {
+    const t = wire()
+    const l = api.left(t.a)
+    const r = api.right(t.b)
+    r.serve({
+      watch: () => (next) => {
+        next(1)
+        return () => {
+          throw new Error('bad teardown')
+        }
+      },
+    })
+    const it = l.watch({ q: 'x' })
+    expect(await it.next()).toEqual({ value: 1, done: false })
+    await expect(it.return?.()).resolves.toEqual({ value: undefined, done: true })
+    await settled()
+  })
+
+  it('fails the stream when subscribing throws', async () => {
+    const t = wire()
+    const l = api.left(t.a)
+    const r = api.right(t.b)
+    r.serve({
+      watch: () => () => {
+        throw new Error('cannot subscribe')
+      },
+    })
+    await expect(l.watch({ q: 'x' }).next()).rejects.toThrow('cannot subscribe')
+  })
+
+  it('takes a source from an async handler, and a port listener as one', async () => {
+    const t = wire()
+    const l = api.left(t.a)
+    const r = api.right(t.b)
+    const [feed, upstream] = linkPair<number>()
+    r.serve({ watch: async () => (next, close) => upstream.listen(next, { onClose: close }) })
+
+    const it = l.watch({ q: 'x' })
+    const first = it.next()
+    await settled()
+    feed.send(7)
+    expect(await first).toEqual({ value: 7, done: false })
+
+    feed.close()
+    expect(await it.next()).toEqual({ value: undefined, done: true })
+  })
+})
+
 describe('on.X raw API', () => {
   it('exposes payload, respond, fail and signal for calls; a second respond is ignored', async () => {
     const t = wire()
@@ -650,7 +828,7 @@ describe('direction enforcement', () => {
   })
 })
 
-describe('channel', () => {
+describe('symmetric', () => {
   const room = symmetric('room', {
     chat: both<string>(),
     ping: both<void>().reply<number>(),
