@@ -1,0 +1,25 @@
+name: Test
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - '*'
+
+jobs:
+  run_tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10
+
+      - name: install
+        run: pnpm install
+      - name: typecheck
+        run: pnpm typecheck
+      - name: transpile
+        run: pnpm build
+      - name: test
+        run: pnpm test

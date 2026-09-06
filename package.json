@@ -1,0 +1,88 @@
+{
+  "name": "@lickle/wire",
+  "version": "0.0.0-dev.13",
+  "description": "Composable transport, RPC, and state-replication primitives for the browser, workers, and Node. Zero runtime dependencies.",
+  "author": "Dan Beaven <dm.beaven@gmail.com>",
+  "license": "MIT",
+  "homepage": "https://github.com/Pingid/lickle-wire#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Pingid/lickle-wire.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Pingid/lickle-wire/issues"
+  },
+  "type": "module",
+  "main": "dist/index.js",
+  "module": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./rpc": {
+      "types": "./dist/rpc/index.d.ts",
+      "import": "./dist/rpc/index.js"
+    },
+    "./replica": {
+      "types": "./dist/replica/index.d.ts",
+      "import": "./dist/replica/index.js"
+    },
+    "./browser": {
+      "types": "./dist/adapter/browser.d.ts",
+      "import": "./dist/adapter/browser.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "wire",
+    "rpc",
+    "transport",
+    "pubsub",
+    "worker",
+    "messageport",
+    "postmessage",
+    "broadcastchannel",
+    "chrome-extension",
+    "replication",
+    "last-writer-wins",
+    "peer-to-peer",
+    "typescript",
+    "zero-dependencies"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "format": "prettier --write .",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "docs:build": "pnpm ldocs build",
+    "prepublishOnly": "pnpm typecheck && pnpm test && pnpm build"
+  },
+  "devDependencies": {
+    "@lickle/docs": "0.0.2-dev.2",
+    "jsr": "^0.14.3",
+    "prettier": "^3.8.3",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.0"
+  },
+  "prettier": {
+    "semi": false,
+    "singleQuote": true,
+    "printWidth": 120,
+    "trailingComma": "all"
+  }
+}

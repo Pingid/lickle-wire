@@ -1,0 +1,11 @@
+{
+  "name": "@lickle/wire",
+  "version": "0.0.0-dev.3",
+  "license": "MIT",
+  "exports": {
+    ".": "./src/index.ts",
+    "./rpc": "./src/rpc/index.ts",
+    "./replica": "./src/replica/index.ts",
+    "./browser": "./src/adapter/browser.ts"
+  }
+}
