@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { pair, type ILink } from './link/index.ts'
+import { pair, type Link } from './link/index.ts'
 import { noop } from '../core/internal.ts'
 import * as Protocol from './protocol.ts'
 import { Hub } from './hub.ts'
@@ -10,7 +10,7 @@ type Bus = { a: number; b: string; x: unknown }
 const settled = () => new Promise<void>((r) => setTimeout(r, 0))
 
 /** A raw peer: one end of a pair, the other accepted by the hub. */
-const raw = (hub: Hub<Bus>, name = 'peer', meta: ILink.Meta = {}) => {
+const raw = (hub: Hub<Bus>, name = 'peer', meta: Link.Meta = {}) => {
   const [mine, theirs] = pair<Protocol.Envelope>(name, hub.name, { metaA: meta })
   const sent: Protocol.Envelope[] = []
   mine.listen((m) => {
@@ -476,9 +476,9 @@ describe('Hub', () => {
 
   it('serve() installs a source that its teardown, its signal and close() all stop', async () => {
     const hub = Hub.create<Bus>('h')
-    const installed: Array<(link: ILink<Protocol.Envelope>) => void> = []
+    const installed: Array<(link: Link<Protocol.Envelope>) => void> = []
     const torn = vi.fn()
-    const source: ILink.Source<Protocol.Envelope> = (onLink) => {
+    const source: Link.Source<Protocol.Envelope> = (onLink) => {
       installed.push(onLink)
       return torn
     }

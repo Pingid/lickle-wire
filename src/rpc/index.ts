@@ -7,7 +7,7 @@
  * both ends run the same code and there is no side to choose.
  */
 
-export type { Port, Unsub } from '../core/index.ts'
+export type { ListenOptions, Port, Unsub } from '../core/index.ts'
 export type { Validate } from '../core/validate.ts'
 export * from './protocol.ts'
 export * from './spec.ts'

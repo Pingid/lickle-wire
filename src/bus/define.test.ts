@@ -3,7 +3,7 @@ import { define } from './define.js'
 import * as Protocol from './protocol.ts'
 import type { Hub } from './hub.js'
 import { noop } from '../core/internal.ts'
-import { pair, type ILink } from './link/index.ts'
+import { pair, type Link } from './link/index.ts'
 import type { Session } from './session.js'
 import { fakeClock } from './testing.js'
 
@@ -27,7 +27,7 @@ const raw = (hub: Hub<Bus>) => {
 }
 
 /** A session on one end of a pair, greeted by hand. */
-const greeted = <S extends Session<Bus, ILink<Protocol.Envelope>>>(make: (link: ILink<Protocol.Envelope>) => S) => {
+const greeted = <S extends Session<Bus, Link<Protocol.Envelope>>>(make: (link: Link<Protocol.Envelope>) => S) => {
   const [mine, theirs] = pair<Protocol.Envelope>('client', 'app')
   const session = make(mine)
   const fn = vi.fn()

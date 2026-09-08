@@ -43,7 +43,7 @@ Each worker joins the same bus by name, over the port it already holds:
 import { Session } from '@lickle/wire'
 import { link } from '@lickle/wire/browser'
 
-const session = Session.over<Channels>('app', link(self))
+const session = Session.over<Channels>('app', link(workerSelf()))
 await session.ready()
 
 session.topic('tick').listen((t, meta) => console.log(t, meta.retained ? '(replayed)' : ''))
@@ -123,22 +123,35 @@ interface ListenOptions {
 }
 ```
 
-A link is a port. A topic is a port. Either side of an RPC protocol is a port. `link(worker)` is a
+A link is a port. A topic is a port. Either side of an RPC protocol is a port. `asPort(worker)` is a
 port. So RPC and replication run over any of them — a worker directly, a hub topic, or a test double —
 without adapters. Anything you build that satisfies the interface plugs in the same way.
 
-### Link
-
-Layer 0: one end of an open duplex symmetric, with reconnection.
+`Port` is the currency, and there is exactly one tier above it. `rpc` and `replica` take a `Port`
+because two members is all they ever needed. `Hub`, `Session` and `persistent` take a `Link`, because
+routing needs to know when a peer went away. Going down is free — a `Link` _is_ a `Port` — and `asLink`
+is the way back up:
 
 ```ts
-import { Link } from '@lickle/wire'
+import { asLink } from '@lickle/wire'
+
+hub.serve(asLink(anyPort)) // `up` is "not closed"; the port's `onClose` becomes `closed`
+```
+
+A platform module's whole job is to get you to `Port`. Everything above it is generic.
+
+### Link
+
+Layer 0: one end of an open duplex channel, with reconnection.
+
+```ts
+import { pair, persistent } from '@lickle/wire'
 
 const [a, b] = pair<string>() // two cross-wired in-memory ends
 b.listen((m) => console.log(m))
 a.send('hi') // structured-cloned and delivered on a microtask, like a real transport
 
-const link = persistent(() => connect(), {
+const link = persistent(connector, {
   backoff: { base: 250, max: 30_000 },
   jitter: 0.2,
   timeout: 10_000, // give up an attempt that never delivers a first message
@@ -150,9 +163,36 @@ link.state // 'connecting' | 'open' | 'retrying' | 'closed'
 link.retryNow() // for `online` and `visibilitychange` handlers
 ```
 
-An `ILink` adds `remote`, `meta`, `up`, `changed(fn)`, `closed(fn)` and `close()` to the port contract. `send`
+A `Link` adds `remote`, `meta`, `up`, `changed(fn)`, `closed(fn)` and `close()` to the port contract. `send`
 never throws and returns `false` when a message was dropped. Inbound messages that arrive before the first
 `listen` are buffered, so a greeting is never lost.
+
+`up` and "open" are separate: a link can be alive and down — `persistent` between attempts, a socket
+still connecting — which is why `changed` exists alongside `closed`. `closed` is terminal.
+
+A `slot` is a link whose transport you swap by hand. Consumers hold the slot and subscribe once; every
+`listen`, `changed` and `closed` survives the swap, and only the slot's own subscription to the inner
+link is torn down and rebuilt:
+
+```ts
+import { slot } from '@lickle/wire'
+
+const wire = slot<Envelope>({ buffer: 64 })
+const session = app.session(wire) // subscribes once, to the slot
+
+const off = wire.use(link(new Worker('./a.ts'))) // attach; `off` detaches
+wire.use(link(new Worker('./b.ts'))) // swap — `off` is now inert
+wire.inner // the transport in use, or null
+```
+
+`use` returns a teardown like every other subscription here, and the teardown of a transport that has
+since been replaced does nothing — so detaching late cannot cut someone else's wire. An inner closing
+detaches the slot rather than ending it; only `slot.close()` is terminal. Sends made while nothing is
+attached are held per `buffer`/`ttl`/`overflow` and flushed when one is.
+
+`persistent` is a slot with a retry policy driving the swaps. Reach for a slot when the schedule is not
+a backoff curve: a peer the user picks from a list, a worker swapped on hot reload, a test that wants to
+cut the wire and splice it back.
 
 ### Session and Topic
 
@@ -160,7 +200,7 @@ Layer 2: the client side. A session owns its _subscription intent_ — the link 
 not, and it is replayed on every reconnect.
 
 ```ts
-const session = Session.over<Channels>('app', link(self)) // ends when the link does
+const session = Session.over<Channels>('app', link(workerSelf())) // ends when the link does
 const reconnecting = Session.over<Channels>('app', persistent(connector))
 
 await session.ready()
@@ -174,7 +214,7 @@ for await (const n of tick.stream({ signal })) {
 tick.send(3)
 tick.send(3, { to: peerId }) // one peer only, bypassing subscriptions
 
-const rr = session.topic('req', 'res') // publish on one symmetric, listen on another
+const rr = session.topic('req', 'res') // publish on one channel, listen on another
 const direct = tick.peer(peerId) // a Port that only talks to one peer
 
 session.on('open' | 'close' | 'error', fn)
@@ -207,7 +247,7 @@ const hub = app.hub({
   policy: {
     canAccept: async (peer) => verify(peer.meta), // frames are held until this settles
     canSubscribe: (peer, channel) => true,
-    canPublish: (peer, symmetric, payload) => true,
+    canPublish: (peer, channel, payload) => true,
     canAddress: (from, to, channel) => true,
   },
 })
@@ -351,6 +391,58 @@ the handler sees `ctx.signal` abort. Leaving a `for await` early — `break`, `r
 same. Streaming handlers must observe their signal: an `async function*` that never yields to the event
 loop cannot be stopped.
 
+### Meta
+
+Every frame has room for a bag of arbitrary keys beside the payload — a trace id, a token, a clock
+reading. It sits outside the spec and outside validation: a descriptor says what a message _means_, and
+meta says something about the circumstances it was sent in.
+
+```ts
+l.log('hello', { meta: { trace } }) // notifications
+await l.getUser({ id: '1' }, { meta: { trace }, signal }) // calls
+for await (const row of l.watch(query, { meta: { trace } })) {
+} // streams
+
+r.serve({
+  log: (s, ctx) => console.log(s, ctx.meta['trace']),
+  getUser: ({ id }, ctx) => lookup(id, ctx.meta['token']),
+})
+
+r.on.log((s, meta) => console.log(s, meta['trace'])) // and under `on`, as a second argument
+```
+
+Responses carry it too — `respond(value, meta)`, `next(value, meta)`, `end(meta)`, `fail(error, meta)`.
+A call resolves to its payload and nothing else, so response meta is read off the side itself, which is a
+port over decoded messages:
+
+```ts
+l.listen((m) => {
+  if (m.re === 'ok') console.log(m.meta)
+})
+```
+
+A codec can contribute meta too, which is how a layer passes down what it alone knows — the hop it came
+over, the identity it just verified. Whatever it hands `next` as a second argument joins the frame's own:
+
+```ts
+const enveloped = api.with<Env>({
+  encode: (frame) => ({ hop: here, frame }),
+  decode: (env, next) => next(env.frame, { hop: env.hop }),
+})
+```
+
+Layers merge outermost-last, and every layer outranks the wire, so what a codec vouches for cannot be
+spoofed by the far side claiming the same key.
+
+A frame that carries no meta has no `meta` key, and a listener that was sent none is handed `{}`. The
+contents are never validated; the shape is — a frame whose `meta` is not an object is rejected like any
+other malformed frame.
+
+One cost: a lone argument is ambiguous between a payload and options, so options are recognised
+structurally — a live `AbortSignal` in `signal`, or an object carrying nothing but `meta`. A payload that
+is itself exactly `{ meta }` is therefore read as options; pass the options explicitly to disambiguate,
+`l.echo({ meta: x }, {})`. The same already applied to `{ signal }`.
+
 ### What's derived
 
 | From the spec  | You get                                                                                   |
@@ -416,6 +508,7 @@ too: a frame claiming a message the peer may not originate is rejected the same 
 { _t: 'api', kind: 'getUser', id: '3', re: 'ok', payload: {…} }  // response
 { _t: 'api', kind: 'watch',   id: '4', re: 'next' | 'end' | 'err' }
 { _t: 'api', kind: 'watch',   id: '4', re: 'stop' }              // cancellation
+{ _t: 'api', kind: 'log', payload: 'hi', meta: { trace: 't' } }   // any frame, when meta was attached
 ```
 
 Errors cross as `{ name, message }` and are rehydrated into an `Error`, so they survive structured clone.
@@ -468,11 +561,61 @@ convergence is the reducer's job. Pass `clock: fakeClock()` to drive every timer
 
 ## Browser
 
-`@lickle/wire/browser` speaks one target type, `Link.Target`: a `Worker`, `self` inside one, a
-`MessagePort`, a `BroadcastChannel`, or a `Window` wrapped in `fromWindow`.
+The DOM has no single "thing you post messages to", so `Browser.Target` is a union of the two shapes it
+really has. A `Worker`, a `MessagePort`, a `BroadcastChannel` and a `ServiceWorker` are `Browser.Duplex` —
+one object that both posts and receives — and go in as they are. Everything else is a `Browser.Split`: a
+send half and a receive half that are different objects, which is what `fromWindow`, `fromServiceWorker`
+and `workerSelf` build. A `WebSocket` is a `Split` you write inline in six lines; it needs nothing from
+this package.
+
+The module itself is thin. It contributes those types and two conversions; everything else is
+composition over the library's own generics.
 
 ```ts
-import { link, worker, connector, handshake, bridge, fromWindow } from '@lickle/wire/browser'
+import { asPort, asTarget } from '@lickle/wire/browser'
+
+// DOM -> wire. The whole on-ramp: two members, no lifecycle, no heartbeat.
+rpc.left(asPort(worker))
+replica.reader(def, asPort(broadcastChannel))
+hub.serve(asLink(asPort(worker))) // ...and up a tier when routing needs liveness
+
+// wire -> DOM. A topic, an rpc side or a link, for code that speaks postMessage.
+comlinkish(asTarget(session.topic('api')))
+```
+
+`asPort` attaches on the first listener and detaches on the last, like every `Port`, and its `onClose`
+never fires — a `MessagePort` has no disconnect event, which is exactly what `link`'s heartbeat covers.
+`asTarget` goes the other way and `close` forwards to the source's own, so a `Link` used as a target
+keeps its lifecycle. The two compose in either order, which is what makes adapters stackable.
+
+`asTarget` converts and forgets: what comes back is a `Browser.Duplex` and nothing else. When the caller
+still needs `up`, `changed` or `closed`, `asDuplex` keeps both faces on one object instead:
+
+```ts
+const both = asDuplex(muxChannel) // Link<T> & Browser.Duplex
+
+thirdParty(both) // speaks postMessage
+both.changed((up) => render(up)) // ...and still a link
+both.close() // one connection, closed once, whichever face you reach for
+```
+
+`remote`, `meta` and `up` stay live rather than snapshotted, so a `slot` or a `persistent` underneath
+still tracks. There is no `start` or `terminate` — a link is already running, and is not a resource
+this can destroy.
+
+`link` is the both-at-once convenience — `asPort`'s normalisation, plus liveness, plus ownership:
+
+```ts
+import {
+  link,
+  worker,
+  connector,
+  handshake,
+  bridge,
+  fromWindow,
+  fromServiceWorker,
+  workerSelf,
+} from '@lickle/wire/browser'
 
 // page — the hub here, workers as its peers
 hub.serve(worker('./a.ts'), worker('./b.ts')) // spawned on serve, terminated on teardown
@@ -480,11 +623,14 @@ hub.serve(link(existingWorker)) // a target you already hold
 hub.serve(persistent(() => link(new Worker('./c.ts')))) // respawns on failure
 
 // worker — the hub here, the page as its peer
-hub.serve(link(self))
+hub.serve(link(workerSelf()))
+
+// a service worker: you post to one object and hear on another
+hub.serve(link(fromServiceWorker(() => navigator.serviceWorker.controller)))
 ```
 
 `link` never closes a target it did not create: `own` defaults to true only when the target has
-`terminate`, so `link(self)` cannot close the worker it runs in. Ports have no disconnect event, so every
+`terminate`, so `link(workerSelf())` cannot close the worker it runs in. Ports have no disconnect event, so every
 link runs a symmetric heartbeat.
 
 For peers that connect themselves — frames, or anything behind a relay — the handshake transfers one end of
@@ -499,21 +645,303 @@ const session = app.connect(connector('app', fromWindow(parent, 'https://host.ex
 bridge(window, someWorker, { origins: ['https://frame.example'] })
 
 // the worker
-hub.serve(handshake(self, { origins: ['https://frame.example'] }))
+hub.serve(handshake(workerSelf(), { origins: ['https://frame.example'] }))
 ```
 
 Origins are required, never `'*'` — defaulting would hand a live `MessagePort` to whoever is listening.
+`handshake` returns a source that owns what it produced: its teardown disconnects the peers it accepted,
+it does not merely stop accepting new ones.
+
+`handshake` and `bridge` are `accept` and `relay` with `MessageChannel` filled in. The policy — which
+offers to admit, in what order the checks run, how a relayed hop is recorded, and the rule that
+declining must never touch the channel — lives in the library, so an extension or a server gets the
+same behaviour without reimplementing it.
+
+None of the three take a `Link`, and cannot: they move a `MessagePort`, and `Link.send` has no transfer
+list. That is the mechanism, not a gap in the types — transferring is exactly what keeps an ancestor
+out of the data path. When the next hop _cannot_ take a port, use `tunnel` and a [`mux`](#mux):
+
+```ts
+// the parent, whose next hop is a server rather than a Window
+const up = mux<Envelope>(socketLink, { side: 'a' })
+tunnel(window, up, { origins: ['https://frame.example'] })
+```
+
+`bridge` hands the port on and steps out of the way; `tunnel` carries the traffic. Both vet offers
+identically. Prefer `bridge` whenever the next hop can take a port.
+
+#### Relaying to a worker you replace
+
+A `Browser.Sink` is just an object with `postMessage`, so make it indirect and the relay is wired once
+and always aims at the current worker — no need to re-run `bridge` on every swap:
+
+```ts
+const wire = slot<Envelope>({ own: true }) // the page's own peer link
+let current: Worker | null = null
+
+const to: Browser.Sink = { postMessage: (m, t) => current?.postMessage(m, t ?? []) }
+bridge(window, to, { origins: ['https://frame.example'] }) // once, for good
+
+const spawn = () => {
+  current = new Worker('./hub.js', { type: 'module' })
+  wire.use(link(current)) // closes the worker it replaces, under `own`
+}
+```
+
+Ports are transferred straight to whichever worker is current, so the page never joins the data path.
+Frames connected to the worker that went away reconnect on their own, because `connector` mints a
+fresh channel per attempt.
+
+Use `tunnel` and a [`mux`](#mux) over the slot instead when frames must survive the swap _without_
+reconnecting, or when the next hop cannot take a port at all. A mux re-announces its channels on the
+new transport, so a channel opened over the old one keeps working.
+
+### Transfer
+
+`Port.send` takes one argument and always has. A transfer list as a second parameter would put "can
+this transport hand over ownership?" into every signature that mentions a port, for the one family of
+transports that can — so it rides in the message instead, and the capability becomes a type:
+
+```ts
+interface Transfer.Out<S, C> { data: S; transfer?: readonly C[] }              // what you hand over
+interface Transfer.In<R, C>  { data: R; transfer: readonly C[]; origin: string } // what you were handed
+
+interface TransferPort<S, R = S, C = unknown> extends Port<Transfer.Out<S, C>, Transfer.In<R, C>> {}
+```
+
+Two frames, not one shared shape: outbound you say what you are giving away, inbound you are told what
+you were given _and where it came from_. `origin` belongs only on the second, and is per-message rather
+than per-connection — a page with three frames posts to one `window`, so it cannot live on `meta`.
+
+`C` is whatever the platform calls a connection: a `MessagePort` in a page, a `runtime.Port` in an
+extension, a socket on a server. That is what makes the handshake generic — `postOffer`, `readOffers`
+and `passOffer` are the three roles, and they feed `accept`/`relay` directly:
+
+```ts
+import { postOffer, readOffers, passOffer, accept, relay } from '@lickle/wire'
+
+postOffer(up, 'panel', channel) // connector
+accept(readOffers(up), wrap, { origins }) // acceptor
+relay(readOffers(from), passOffer(up), { origins }) // relay
+```
+
+`@lickle/wire/browser` supplies only `transferPort(target)`, which unwraps `postMessage(data, transfer)`
+and packs `event.ports`/`event.origin`. A plain `Port` or `Link` is not a `TransferPort`, so handing one
+to `connector` is a type error rather than a handshake that half-completes.
+
+### Mux
+
+Many logical links over one real one, for when peers have to connect through a connection you already
+hold. Platform-free — it works over any `Link`, so an extension, a socket or a worker all get it.
+
+```ts
+import { mux } from '@lickle/wire'
+
+const wire = mux<Envelope>(socketLink, { side: 'a' }) // the other end is 'b'
+
+const session = app.session(wire.open('panel')) // a channel, which is just a Link
+hub.serve(wire.incoming) // channels the far side opened, as peers
+```
+
+Each end allocates ids from its own half of the number space — one odd, one even — so the two can open
+at the same moment without negotiating. An `open` arriving from this end's half means both were
+configured as the same `side`, and is reported rather than silently colliding. Channels that arrive
+before anything serves `incoming` are held, for the same reason a link buffers its greeting.
+
+A mux is honest about its cost: unlike a transferred port, it carries every channel's traffic itself.
+It also does not repeat buffering — put a `persistent` or a `slot` underneath and one outbox covers
+every channel at once. `pipe(a, b)` joins two links when a relay has to sit in the middle, which is
+what `tunnel` uses.
+
+---
+
+## Writing an Adapter
+
+A transport is `defineLink`: `open` is handed the inbound half and returns the outbound half. The link
+core does the rest — hold inbound until someone listens, track `up` transitions, fire `closed` exactly
+once, go inert afterwards rather than throw.
+
+```ts
+import { defineLink, defineSource, keepalive, type Link } from '@lickle/wire/adapter'
+```
+
+| You have                                 | You write                           |
+| ---------------------------------------- | ----------------------------------- |
+| A real disconnect event                  | `defineLink` alone                  |
+| No disconnect event                      | `defineLink` + `keepalive`          |
+| Something that connects, not connects to | `defineLink` + `defineSource`       |
+| Something that reconnects                | wrap your connector in `persistent` |
+
+### A `chrome.runtime.Port`
+
+No heartbeat: `onDisconnect` fires on both sides whenever the other context goes, including when an MV3
+service worker is torn down, so liveness is a fact rather than something to infer. Probing it would add
+traffic and a second way to be wrong — and an adapter that never imports `keepalive` carries no timer
+code at all.
+
+```ts
+const chromeLink = <T>(
+  port: chrome.runtime.Port,
+  runtime: typeof chrome.runtime,
+  opts: { meta?: Link.Meta } = {},
+): Link<T> =>
+  defineLink<T>(
+    (host) => {
+      const onMessage = (msg: unknown) => host.deliver(msg as T)
+      // Reading `lastError` is both how chrome tells you why the port died and
+      // how you stop it logging an unchecked-error warning.
+      const onDisconnect = () => {
+        void runtime.lastError
+        host.shut()
+      }
+      port.onMessage.addListener(onMessage)
+      port.onDisconnect.addListener(onDisconnect)
+
+      return {
+        send: (msg) => {
+          try {
+            port.postMessage(msg)
+            return true
+          } catch (err) {
+            // The far end went away between the check and the post.
+            host.fail(err)
+            host.shut()
+            return false
+          }
+        },
+        release: () => {
+          port.onMessage.removeListener(onMessage)
+          port.onDisconnect.removeListener(onDisconnect)
+          port.disconnect()
+        },
+      }
+    },
+    { remote: port.name, meta: { ...opts.meta, sender: port.sender } },
+  )
+
+// Every context that connects, as a peer: `hub.serve(chromeSource(chrome.runtime))`.
+const chromeSource = <T>(runtime: typeof chrome.runtime): Link.Source<T> =>
+  defineSource<T>((host) => {
+    const onConnect = (port: chrome.runtime.Port) => host.offer(chromeLink<T>(port, runtime))
+    runtime.onConnect.addListener(onConnect)
+    return () => runtime.onConnect.removeListener(onConnect)
+  })
+```
+
+`defineSource` owns what it produced: the teardown closes links still open and forgets ones that closed
+themselves, so stopping a source disconnects its peers instead of leaking them.
+
+When peers connect themselves and have to be vetted, `accept` is `defineSource` plus the policy — an
+origin allowlist, a `filter` that is shown the offer but never the channel, and the hop recording that
+builds `peer.meta.path`. The platform supplies only how an offer arrives:
+
+```ts
+const chromeAccept = <T>(runtime: typeof chrome.runtime): Link.Source<T> =>
+  accept<T, chrome.runtime.Port>(
+    (take) => {
+      const on = (p: chrome.runtime.Port) =>
+        take({ name: p.name, origin: p.sender?.origin ?? '', path: [], channel: p })
+      runtime.onConnect.addListener(on)
+      return () => runtime.onConnect.removeListener(on)
+    },
+    (offer, meta) => chromeLink<T>(offer.channel, runtime, { meta }),
+    { origins: [`chrome-extension://${runtime.id}`] },
+  )
+```
+
+### A node `worker_threads` port
+
+`@types/node` models it as an `EventEmitter`, so it satisfies no DOM target type — which costs nothing,
+because `defineLink` never asked for one.
+
+```ts
+const threadLink = <T>(port: MessagePort): Link<T> =>
+  defineLink<T>((host) => {
+    const on = (msg: T) => host.deliver(msg)
+    port.on('message', on)
+    port.once('close', host.shut)
+    return {
+      send: (msg) => (port.postMessage(msg), true),
+      release: () => {
+        port.off('message', on)
+        port.close()
+      },
+    }
+  })
+```
+
+### A `WebSocket`
+
+The case where `up` is not "not shut": a socket is alive and unusable while it is connecting, and
+`readyState` is the truth. `host.alive` is whether the link is over; `up` is whether `send` can reach
+anyone. Wrap it in `persistent` and sends made while down are held rather than dropped.
+
+```ts
+const socketLink = <T>(url: string): Link<T> =>
+  defineLink<T>(
+    (host) => {
+      const ws = new WebSocket(url)
+      const onOpen = () => host.signal(true)
+      const onMessage = (e: MessageEvent) => {
+        try {
+          host.deliver(JSON.parse(String(e.data)) as T)
+        } catch (err) {
+          // A frame we cannot read is a bad payload, not a dead socket.
+          host.fail(err)
+        }
+      }
+      // `error` never arrives without a `close` behind it, so only `close` is terminal.
+      const onError = (e: Event) => host.fail(e)
+      const onClose = () => host.shut()
+
+      ws.addEventListener('open', onOpen)
+      ws.addEventListener('message', onMessage)
+      ws.addEventListener('error', onError)
+      ws.addEventListener('close', onClose)
+
+      return {
+        send: (msg) => {
+          if (ws.readyState !== WebSocket.OPEN) return false
+          ws.send(JSON.stringify(msg))
+          return true
+        },
+        release: () => {
+          ws.removeEventListener('open', onOpen)
+          ws.removeEventListener('message', onMessage)
+          ws.removeEventListener('error', onError)
+          ws.removeEventListener('close', onClose)
+          if (ws.readyState < WebSocket.CLOSING) ws.close(1000)
+        },
+      }
+    },
+    { remote: url, meta: { url }, up: false },
+  )
+```
+
+### The pieces
+
+| Export                                      | For                                                              |
+| ------------------------------------------- | ---------------------------------------------------------------- |
+| `host.deliver` / `signal` / `shut` / `fail` | everything a transport can report; `alive` is whether it is over |
+| `keepalive(send, onDead, opts)`             | ping/pong for transports with no disconnect event                |
+| `defineSource(open, opts)`                  | a listener that yields peers, owning what it produced            |
+| `detacher()`                                | a teardown set that cannot be beaten by a synchronous `closed`   |
+| `bind(attach, signal)`                      | attach and detach as one expression                              |
+| `emitter()`                                 | signal-aware listener bookkeeping                                |
+| `outbox(opts)`                              | holding sends while a link is down, with ttl and overflow        |
 
 ---
 
 ## Entry Points
 
-| Import                 | Contents                                                                       |
-| ---------------------- | ------------------------------------------------------------------------------ |
-| `@lickle/wire`         | `Port`, `Hub`, `Session`, `define`, `pair`, `persistent`, `ILink`, `fakeClock` |
-| `@lickle/wire/rpc`     | `pair`, `symmetric`, `send`, `recv`, `both`, `stream`, `mount`, `Frame`        |
-| `@lickle/wire/replica` | `define`, `reader`, `writer`, `readerWriter`, `Replica`                        |
-| `@lickle/wire/browser` | `link`, `worker`, `connector`, `handshake`, `bridge`, `fromWindow`             |
+| Import                 | Contents                                                                                                                                                          |
+| ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `@lickle/wire`         | `Port`, `Link`, `Hub`, `Session`, `define`, `pair`, `persistent`, `asLink`, `queue`, `fakeClock`                                                                  |
+| `@lickle/wire/rpc`     | `pair`, `symmetric`, `send`, `recv`, `both`, `stream`, `mount`, `Frame`                                                                                           |
+| `@lickle/wire/replica` | `define`, `reader`, `writer`, `readerWriter`, `Replica`                                                                                                           |
+| `@lickle/wire/adapter` | `defineLink`, `defineSource`, `keepalive`, `detacher`, `bind`, `emitter`                                                                                          |
+| `@lickle/wire/browser` | `asPort`, `asTarget`, `asDuplex`, `transferPort`, `link`, `worker`, `connector`, `handshake`, `bridge`, `tunnel`, `fromWindow`, `fromServiceWorker`, `workerSelf` |
+| `@lickle/wire/testing` | `fakeClock`                                                                                                                                                       |
 
 ---
 
@@ -524,7 +952,7 @@ synchronous close — so a test that passes over it passes in production. `fakeC
 heartbeats and replication timers deterministically.
 
 ```ts
-import { Link } from '@lickle/wire'
+import { pair, persistent } from '@lickle/wire'
 import { fakeClock } from '@lickle/wire/testing'
 
 const clock = fakeClock()

@@ -6,7 +6,8 @@
  * port, and `@lickle/wire/rpc` and `@lickle/wire/replica` run over any port.
  */
 
-export type { Clock, Port, Unsub, Validate } from './core/index.ts'
+export type { Clock, ListenOptions, Port, Unsub, Validate } from './core/index.ts'
+export { queue, type Queue, type QueueIterator, type QueueOptions } from './core/index.ts'
 
 export type { Replica } from './replica/index.ts'
 export * as replica from './replica/index.ts'

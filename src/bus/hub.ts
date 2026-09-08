@@ -1,6 +1,7 @@
 import { attempt, emitter, isPromise, noop, report, validateSync, type Emitter } from '../core/internal.ts'
-import type { Port, Unsub } from '../index.ts'
-import { pair, type ILink } from './link/index.ts'
+import { detacher, type Detacher } from '../core/index.ts'
+import type { ListenOptions, Unsub } from '../index.ts'
+import { pair, type Link } from './link/index.ts'
 import * as Protocol from './protocol.ts'
 import { Session } from './session.ts'
 
@@ -20,7 +21,7 @@ export declare namespace Hub {
   export interface Peer<T extends Protocol.Topics> {
     readonly id: string
     readonly name: string
-    readonly meta: ILink.Meta
+    readonly meta: Link.Meta
     /**
      * Snapshot of the peer's subscriptions at `rev`. A new object is minted on
      * every change rather than mutated in place, so identity comparison is a
@@ -84,14 +85,14 @@ export declare namespace Hub {
 /** Not public: one accepted peer's bookkeeping. */
 type Entry<T extends Protocol.Topics> = {
   readonly id: string
-  readonly link: ILink<Protocol.Envelope>
+  readonly link: Link<Protocol.Envelope>
   readonly channels: Set<keyof T & string>
   peer: Hub.Peer<T>
   /** False until `canAccept` has allowed it. Pending peers are invisible. */
   live: boolean
   /** Frames held while `canAccept` is outstanding. */
   held: Protocol.Frame[] | null
-  stops: Unsub[]
+  stops: Detacher
   remove(): void
 }
 
@@ -144,7 +145,7 @@ export class Hub<T extends Protocol.Topics = Protocol.Topics> {
     return e && e.live ? e.peer : null
   }
 
-  onPeersChange(fn: (peers: readonly Hub.Peer<T>[]) => void, opts: Port.ListenOptions = {}): Unsub {
+  onPeersChange(fn: (peers: readonly Hub.Peer<T>[]) => void, opts: ListenOptions = {}): Unsub {
     if (this.#closed) {
       opts.onClose?.()
       return noop
@@ -170,7 +171,7 @@ export class Hub<T extends Protocol.Topics = Protocol.Topics> {
    * hub.serve(handshake(self)) // peers that transfer their own port
    * ```
    */
-  serve(...sources: ILink.Servable<Protocol.Envelope>[]): Unsub {
+  serve<E extends Protocol.Envelope>(...sources: Link.Servable<E>[]): Unsub {
     if (this.#closed) {
       for (const s of sources) if (typeof s !== 'function') s.close()
       return noop
@@ -188,7 +189,7 @@ export class Hub<T extends Protocol.Topics = Protocol.Topics> {
   }
 
   /** Register one link as a peer. Returns a teardown that deregisters and closes it. */
-  #accept(link: ILink<Protocol.Envelope>): Unsub {
+  #accept(link: Link<Protocol.Envelope>): Unsub {
     if (this.#closed) {
       link.close()
       return () => {}
@@ -203,7 +204,7 @@ export class Hub<T extends Protocol.Topics = Protocol.Topics> {
       channels,
       live: false,
       held: [],
-      stops: [],
+      stops: detacher(),
       peer: {
         id,
         name: link.remote,
@@ -214,22 +215,19 @@ export class Hub<T extends Protocol.Topics = Protocol.Topics> {
         close: () => link.close(),
       },
       remove: () => {
-        for (const s of entry.stops) s()
-        entry.stops = []
+        entry.stops.stop()
         const was = entry.live
         if (this.#peers.delete(id) && was) this.#changed()
       },
     }
 
     this.#peers.set(id, entry)
-    // `closed` fires synchronously here if the link is already dead, so
-    // `remove` may run before these are assigned.
-    entry.stops = [link.listen((m) => this.#recv(id, m)), link.closed(entry.remove)]
-    if (!this.#peers.has(id)) {
-      for (const s of entry.stops) s()
-      entry.stops = []
-      return () => {}
-    }
+    // `closed` fires synchronously here if the link is already dead, so `remove`
+    // may run mid-attach. The detacher runs each teardown as it arrives once it
+    // has stopped, instead of holding one that nobody will ever call.
+    entry.stops.add(link.listen((m) => this.#recv(id, m)))
+    entry.stops.add(link.closed(entry.remove))
+    if (!this.#peers.has(id)) return () => {}
 
     const verdict = attempt<boolean | Promise<boolean>>(
       () => this.#policy.canAccept?.(entry.peer) ?? true,
@@ -296,7 +294,7 @@ export class Hub<T extends Protocol.Topics = Protocol.Topics> {
     this.#watchers.clear()
   }
 
-  #withEnd(off: Unsub, opts: Port.ListenOptions): Unsub {
+  #withEnd(off: Unsub, opts: ListenOptions): Unsub {
     const onClose = opts.onClose
     if (!onClose) return off
     const offGone = this.#gone.add(() => onClose(), opts.signal)

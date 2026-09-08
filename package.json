@@ -30,6 +30,14 @@
       "types": "./dist/replica/index.d.ts",
       "import": "./dist/replica/index.js"
     },
+    "./adapter": {
+      "types": "./dist/adapter/index.d.ts",
+      "import": "./dist/adapter/index.js"
+    },
+    "./testing": {
+      "types": "./dist/bus/testing.d.ts",
+      "import": "./dist/bus/testing.js"
+    },
     "./browser": {
       "types": "./dist/adapter/browser.d.ts",
       "import": "./dist/adapter/browser.js"
@@ -64,7 +72,7 @@
     "provenance": true
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "format": "prettier --write .",
     "test": "vitest run",

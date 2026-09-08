@@ -1,7 +1,7 @@
 import { Hub } from './hub.ts'
 import type { Envelope, Topics, Validators } from './protocol.ts'
 import { persistent, type Persistent } from './link/index.ts'
-import type { ILink } from './link/index.ts'
+import type { Link } from './link/index.ts'
 import { Session } from './session.ts'
 
 export interface DefineOptions<T extends Topics> extends Hub.Options<T> {
@@ -23,7 +23,7 @@ export interface Definition<T extends Topics> {
    * Client over a link you already hold. No reconnection: when the link dies,
    * the session ends with it. Use this for in-memory pairs and tests.
    */
-  session(link: ILink<Envelope>, opts?: Session.Options<T>): Session<T, ILink<Envelope>>
+  session(link: Link<Envelope>, opts?: Session.Options<T>): Session<T, Link<Envelope>>
   /**
    * Client that reconnects. Equivalent to
    * `session(Link.persistent(connector, opts), opts)`, but the returned
@@ -31,7 +31,7 @@ export interface Definition<T extends Topics> {
    * and `retryNow()` are reachable without a cast.
    */
   connect(
-    connector: ILink.Connector<Envelope>,
+    connector: Link.Connector<Envelope>,
     opts?: Session.Options<T> & Persistent.Options,
   ): Session<T, Persistent<Envelope>>
 }
@@ -56,7 +56,7 @@ export const define = <T extends Topics>(spec: DefineOptions<T>): Definition<T> 
     name,
     hub: (opts = {}) => Hub.create<T>(name, { ...shared, ...opts, validate: opts.validate ?? shared.validate }),
     session: (link, opts = {}) =>
-      Session.over<T, ILink<Envelope>>(name, link, { ...opts, validate: opts.validate ?? shared.validate }),
+      Session.over<T, Link<Envelope>>(name, link, { ...opts, validate: opts.validate ?? shared.validate }),
     connect: (connector, opts = {}) =>
       Session.over<T, Persistent<Envelope>>(name, persistent(connector, opts), {
         ...opts,
