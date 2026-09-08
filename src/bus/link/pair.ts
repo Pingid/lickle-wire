@@ -1,8 +1,8 @@
-import { baseLink, type BaseLink } from './base.ts'
+import { defineLink } from './base.ts'
 import { report } from '../../core/internal.ts'
-import type { ILink } from './index.ts'
+import type { Link } from './index.ts'
 
-export type Pair<T> = readonly [ILink<T>, ILink<T>]
+export type Pair<T> = readonly [Link<T>, Link<T>]
 
 export declare namespace Pair {
   export interface Options {
@@ -13,8 +13,8 @@ export declare namespace Pair {
      * the payloads are known to be immutable.
      */
     clone?: boolean | (<V>(value: V) => V) | undefined
-    metaA?: ILink.Meta | undefined
-    metaB?: ILink.Meta | undefined
+    metaA?: Link.Meta | undefined
+    metaB?: Link.Meta | undefined
     /** Inbound buffered before the first `listen`. Matches the adapters. */
     pending?: number | undefined
     onError?: ((err: unknown) => void) | undefined
@@ -37,38 +37,47 @@ export const pair = <T>(nameA = 'A', nameB = 'B', opts: Pair.Options = {}): Pair
   const metaB = opts.metaB ?? {}
   let open = true
 
-  const core = (i: 0 | 1): BaseLink<T> =>
-    baseLink<T>({
-      describe: () => ({ remote: i === 0 ? nameB : nameA, meta: i === 0 ? metaB : metaA }),
-      pending: opts.pending,
-      onError: opts.onError,
-    })
-
-  const cores = [core(0), core(1)] as const
+  // Each end delivers into the other's host, so they are collected as they are
+  // built rather than passed in: the first end exists before the second does.
+  const hosts: Link.Host<T>[] = []
 
   const shut = () => {
     if (!open) return
     open = false
-    for (const c of cores) c.shut()
+    for (const h of hosts) h.shut()
   }
 
-  const end = (i: 0 | 1): ILink<T> =>
-    cores[i].expose((msg) => {
-      if (!open) return false
-      let copy: T
-      try {
-        copy = clone(msg)
-      } catch (err) {
-        // A payload that would fail structured clone on a real transport. Fail
-        // here too, rather than letting it work in tests only.
-        report(err, opts.onError)
-        return false
-      }
-      queueMicrotask(() => {
-        if (open) cores[(1 - i) as 0 | 1].deliver(copy)
-      })
-      return true
-    }, shut)
+  const end = (i: 0 | 1): Link<T> =>
+    defineLink<T>(
+      (host) => {
+        hosts[i] = host
+        return {
+          send: (msg) => {
+            if (!open) return false
+            let copy: T
+            try {
+              copy = clone(msg)
+            } catch (err) {
+              // A payload that would fail structured clone on a real transport.
+              // Fail here too, rather than letting it work in tests only.
+              report(err, opts.onError)
+              return false
+            }
+            queueMicrotask(() => {
+              if (open) hosts[(1 - i) as 0 | 1]?.deliver(copy)
+            })
+            return true
+          },
+          close: shut,
+        }
+      },
+      {
+        remote: i === 0 ? nameB : nameA,
+        meta: i === 0 ? metaB : metaA,
+        pending: opts.pending,
+        onError: opts.onError,
+      },
+    )
 
   return [end(0), end(1)] as const
 }

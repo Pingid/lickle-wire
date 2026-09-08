@@ -3,7 +3,7 @@
  * collected by vitest.
  */
 import { test } from 'vitest'
-import type { ILink, Session } from '../index.ts'
+import type { Link, Session } from '../index.ts'
 import {
   both,
   symmetric,
@@ -13,10 +13,13 @@ import {
   send,
   stream,
   type CallOptions,
+  type ListenOptions,
+  type Meta,
   type Port,
   type Frame,
   type RecvMsg,
   type SendMsg,
+  type SendOptions,
   type Source,
   type Unsub,
   type Validate,
@@ -56,7 +59,7 @@ const api = pair('api', {
   shortStream: stream<string, Row>(),
 })
 
-const transport: Port.Port<Frame, Frame> = {
+const transport: Port<Frame, Frame> = {
   send: () => {},
   listen: () => () => {},
 }
@@ -65,8 +68,8 @@ const r = api.right(transport)
 
 // --- generated call surface: left ------------------------------------------
 
-expect<typeof l.log>().is<(payload: string) => void>()
-expect<typeof l.ready>().is<() => void>() // void payload takes no argument
+expect<typeof l.log>().is<(payload: string, opts?: SendOptions) => void>()
+expect<typeof l.ready>().is<(opts?: SendOptions) => void>() // void payload takes no argument
 expect<typeof l.getUser>().is<(payload: { id: string }, opts?: CallOptions) => Promise<User>>()
 expect<typeof l.watch>().is<(payload: { q: string }, opts?: CallOptions) => AsyncIterableIterator<Row>>()
 expect<typeof l.shorthand>().is<(payload: string, opts?: CallOptions) => Promise<boolean>>()
@@ -80,9 +83,9 @@ l.ping
 
 // --- generated call surface: right -----------------------------------------
 
-expect<typeof r.push>().is<(payload: ServerEvent) => void>()
+expect<typeof r.push>().is<(payload: ServerEvent, opts?: SendOptions) => void>()
 expect<typeof r.ping>().is<(opts?: CallOptions) => Promise<number>>() // void payload: options only
-expect<typeof r.ready>().is<() => void>() // `both` reaches both sides
+expect<typeof r.ready>().is<(opts?: SendOptions) => void>() // `both` reaches both sides
 
 // @ts-expect-error `log` is left-originated
 r.log
@@ -92,33 +95,43 @@ r.watch
 
 // --- inbound listeners ------------------------------------------------------
 
-expect<typeof r.on.log>().is<(fn: (incoming: string) => void, opts?: Port.ListenOptions) => Unsub>()
-expect<typeof l.on.push>().is<(fn: (incoming: ServerEvent) => void, opts?: Port.ListenOptions) => Unsub>()
-expect<typeof l.on.ready>().is<(fn: (incoming: void) => void, opts?: Port.ListenOptions) => Unsub>()
+// every listener is handed the frame's meta alongside the message
+expect<typeof r.on.log>().is<(fn: (incoming: string, meta: Meta) => void, opts?: ListenOptions) => Unsub>()
+expect<typeof l.on.push>().is<(fn: (incoming: ServerEvent, meta: Meta) => void, opts?: ListenOptions) => Unsub>()
+expect<typeof l.on.ready>().is<(fn: (incoming: void, meta: Meta) => void, opts?: ListenOptions) => Unsub>()
 
-// a request carries the means to answer it, and a signal for when the asker leaves
+// a request carries the means to answer it, a signal for when the asker leaves,
+// and whatever meta the asker attached
 expect<typeof r.on.getUser>().is<
   (
-    fn: (incoming: {
-      payload: { id: string }
-      respond: (value: User) => void
-      fail: (error: unknown) => void
-      signal: AbortSignal
-    }) => void,
-    opts?: Port.ListenOptions,
+    fn: (
+      incoming: {
+        payload: { id: string }
+        meta: Meta
+        respond: (value: User, meta?: Meta) => void
+        fail: (error: unknown, meta?: Meta) => void
+        signal: AbortSignal
+      },
+      meta: Meta,
+    ) => void,
+    opts?: ListenOptions,
   ) => Unsub
 >()
 
 expect<typeof r.on.watch>().is<
   (
-    fn: (incoming: {
-      payload: { q: string }
-      next: (value: Row) => void
-      end: () => void
-      fail: (error: unknown) => void
-      signal: AbortSignal
-    }) => void,
-    opts?: Port.ListenOptions,
+    fn: (
+      incoming: {
+        payload: { q: string }
+        meta: Meta
+        next: (value: Row, meta?: Meta) => void
+        end: (meta?: Meta) => void
+        fail: (error: unknown, meta?: Meta) => void
+        signal: AbortSignal
+      },
+      meta: Meta,
+    ) => void,
+    opts?: ListenOptions,
   ) => Unsub
 >()
 
@@ -173,7 +186,7 @@ r.serve({
 })
 
 // a port's listener is one: `onClose(error?)` is exactly `close`
-const rowPort: Port.Port<never, Row> = {} as any
+const rowPort: Port<never, Row> = {} as any
 r.serve({ watch: () => (next, close) => rowPort.listen(next, { onClose: close }) })
 
 // @ts-expect-error the source must push what the stream declares
@@ -196,8 +209,19 @@ void r.ping({ signal: undefined })
 // @ts-expect-error unknown option
 void l.getUser({ id: '1' }, { bogus: 1 })
 
-// @ts-expect-error notifications take no options
-l.log('x', {})
+// --- meta -------------------------------------------------------------------
+
+// anything may carry meta: a notification, a call, a stream, a void message
+l.log('x', { meta: { trace: 't' } })
+l.ready({ meta: { trace: 't' } })
+void l.getUser({ id: '1' }, { meta: { trace: 't' } })
+void l.watch({ q: 'x' }, { meta: { trace: 't' }, signal: new AbortController().signal })
+
+// @ts-expect-error notifications have nothing to cancel
+l.log('x', { signal: new AbortController().signal })
+
+// @ts-expect-error meta is a bag of keys, not a scalar
+l.log('x', { meta: 1 })
 
 // @ts-expect-error a void message takes no payload
 l.ready(1)
@@ -209,10 +233,10 @@ void consume
 
 // --- a side is a port; links and topics are ports ---------------------------
 
-const _asPort: Port.Port<SendMsg<typeof api.spec, 'l'>, RecvMsg<typeof api.spec, 'l'>> = l
+const _asPort: Port<SendMsg<typeof api.spec, 'l'>, RecvMsg<typeof api.spec, 'l'>> = l
 void _asPort
 
-const link: ILink<Frame> = {} as any
+const link: Link<Frame> = {} as any
 const topic: Session.Topic<Frame, Frame> = {} as any
 void api.left(link)
 void api.left(topic)
@@ -255,7 +279,7 @@ const checked = pair('checked', {
 })
 const cl = checked.left(transport)
 
-expect<typeof cl.log>().is<(payload: string) => void>()
+expect<typeof cl.log>().is<(payload: string, opts?: SendOptions) => void>()
 expect<typeof cl.getUser>().is<(payload: string, opts?: CallOptions) => Promise<User>>()
 expect<typeof cl.watch>().is<(payload: string, opts?: CallOptions) => AsyncIterableIterator<Row>>()
 expect<typeof cl.mixed>().is<(payload: { id: string }, opts?: CallOptions) => Promise<User>>()
@@ -307,22 +331,26 @@ const p2 = room.connect(transport)
 // every instance has the same type, so there is nothing to pick between
 expect<typeof p1>().is<typeof p2>()
 
-expect<typeof p1.chat>().is<(payload: string) => void>()
-expect<typeof p1.ready>().is<() => void>()
+expect<typeof p1.chat>().is<(payload: string, opts?: SendOptions) => void>()
+expect<typeof p1.ready>().is<(opts?: SendOptions) => void>()
 expect<typeof p1.ping>().is<(opts?: CallOptions) => Promise<number>>()
 expect<typeof p1.history>().is<(payload: { q: string }, opts?: CallOptions) => AsyncIterableIterator<Row>>()
 
 // and receives everything it can send
-expect<typeof p1.on.chat>().is<(fn: (incoming: string) => void, opts?: Port.ListenOptions) => Unsub>()
+expect<typeof p1.on.chat>().is<(fn: (incoming: string, meta: Meta) => void, opts?: ListenOptions) => Unsub>()
 expect<typeof p1.on.ping>().is<
   (
-    fn: (incoming: {
-      payload: void
-      respond: (value: number) => void
-      fail: (error: unknown) => void
-      signal: AbortSignal
-    }) => void,
-    opts?: Port.ListenOptions,
+    fn: (
+      incoming: {
+        payload: void
+        meta: Meta
+        respond: (value: number, meta?: Meta) => void
+        fail: (error: unknown, meta?: Meta) => void
+        signal: AbortSignal
+      },
+      meta: Meta,
+    ) => void,
+    opts?: ListenOptions,
   ) => Unsub
 >()
 
@@ -355,7 +383,7 @@ try {
 } catch {}
 
 // a channel is a port, renames, and mounts alongside protocols
-const _peerAsPort: Port.Port<SendMsg<typeof room.spec, 'l'>, RecvMsg<typeof room.spec, 'l'>> = p1
+const _peerAsPort: Port<SendMsg<typeof room.spec, 'l'>, RecvMsg<typeof room.spec, 'l'>> = p1
 void _peerAsPort
 expect<ReturnType<ReturnType<typeof room.at>['connect']>>().is<typeof p1>()
 
@@ -370,9 +398,9 @@ const chat = pair('chat', { say: send<string>(), heard: recv<string>() })
 const app = mount({ api, chat, chat2: chat.at('chat.v2') })
 const both_ = app.left(transport)
 
-expect<typeof both_.chat.say>().is<(payload: string) => void>()
+expect<typeof both_.chat.say>().is<(payload: string, opts?: SendOptions) => void>()
 expect<typeof both_.api.getUser>().is<(payload: { id: string }, opts?: CallOptions) => Promise<User>>()
-expect<typeof both_.chat2.say>().is<(payload: string) => void>()
+expect<typeof both_.chat2.say>().is<(payload: string, opts?: SendOptions) => void>()
 
 // spreading a spec extends a protocol
 const v2 = pair('api.v2', { ...api.spec, cancel: send<string>() })

@@ -1,4 +1,4 @@
-import type { Port, Unsub } from '../index.ts'
+import type { ListenOptions, Unsub } from '../index.ts'
 import type { Validate } from '../core/validate.ts'
 
 // ---------------------------------------------------------------------------
@@ -10,6 +10,17 @@ export type Dir = 'l' | 'r' | 'b'
 
 /** How many responses a message expects. */
 export type Mode = 'none' | 'one' | 'many'
+
+/**
+ * Arbitrary out-of-band data riding alongside a payload — a trace id, a token,
+ * a clock reading, whatever the two ends agree on.
+ *
+ * It is deliberately outside the spec and outside validation: a descriptor says
+ * what a message *means*, and meta says something about the circumstances it
+ * was sent in. Frames carry it only when there is some, so a protocol that
+ * never sets it looks exactly as it did before.
+ */
+export type Meta = Record<string, unknown>
 
 /**
  * One entry in a {@link Spec}. Carries its direction and reply arity at the
@@ -148,15 +159,17 @@ export type Request<T extends Spec, K extends keyof T> = {
   id?: string
   /** Never set on a request; declared so a raw listener can narrow on it. */
   re?: undefined
+  /** Whatever the sender attached. Absent when it attached nothing. */
+  meta?: Meta
 }
 
 export type Response<T extends Spec, K extends keyof T> =
-  | { kind: K; id: string; re: 'next' | 'ok'; payload: T[K]['_r'] }
-  | { kind: K; id: string; re: 'err'; payload: unknown }
-  | { kind: K; id: string; re: 'end' }
+  | { kind: K; id: string; re: 'next' | 'ok'; payload: T[K]['_r']; meta?: Meta }
+  | { kind: K; id: string; re: 'err'; payload: unknown; meta?: Meta }
+  | { kind: K; id: string; re: 'end'; meta?: Meta }
 
 /** Cancellation, sent by the requester back towards the responder. */
-export type Stop<K> = { kind: K; id: string; re: 'stop' }
+export type Stop<K> = { kind: K; id: string; re: 'stop'; meta?: Meta }
 
 type Requests<T extends Spec, D extends Dir> = { [K in Sends<T, D>]: Request<T, K> }[Sends<T, D>]
 type Responses<T extends Spec, D extends Dir> = { [K in Asks<T, Flip<D>>]: Response<T, K> }[Asks<T, Flip<D>>]
@@ -180,14 +193,16 @@ export type Api<T extends Spec, D extends Dir> = {
     ? (...args: [...Args<T[K]['_q']>, opts?: CallOptions]) => Promise<T[K]['_r']>
     : T[K]['mode'] extends 'many'
       ? (...args: [...Args<T[K]['_q']>, opts?: CallOptions]) => AsyncIterableIterator<T[K]['_r']>
-      : (...args: Args<T[K]['_q']>) => void
+      : (...args: [...Args<T[K]['_q']>, opts?: SendOptions]) => void
 }
 
 /** A single request expecting one response. */
 export interface Call<Q, R> {
   payload: Q
-  respond: (value: R) => void
-  fail: (error: unknown) => void
+  /** What the requester attached to the request. Empty when it attached nothing. */
+  meta: Meta
+  respond: (value: R, meta?: Meta) => void
+  fail: (error: unknown, meta?: Meta) => void
   /** Aborts when the requester gives up, or the transport closes. */
   signal: AbortSignal
 }
@@ -195,9 +210,11 @@ export interface Call<Q, R> {
 /** A single request expecting a stream of responses. */
 export interface Subscription<Q, R> {
   payload: Q
-  next: (value: R) => void
-  end: () => void
-  fail: (error: unknown) => void
+  /** What the requester attached to the request. Empty when it attached nothing. */
+  meta: Meta
+  next: (value: R, meta?: Meta) => void
+  end: (meta?: Meta) => void
+  fail: (error: unknown, meta?: Meta) => void
   /** Aborts when the requester stops listening, or the transport closes. */
   signal: AbortSignal
 }
@@ -210,11 +227,17 @@ export type Incoming<T extends Spec, K extends keyof T> = T[K]['mode'] extends '
 
 /** Per-message inbound listeners. Each returns a teardown. */
 export type On<T extends Spec, D extends Dir> = {
-  [K in Recvs<T, D>]: (fn: (incoming: Incoming<T, K>) => void, opts?: Port.ListenOptions) => Unsub
+  [K in Recvs<T, D>]: (fn: (incoming: Incoming<T, K>, meta: Meta) => void, opts?: ListenOptions) => Unsub
 }
 
-/** What a handler is given besides the payload. */
-export interface HandlerContext {
+/** What every handler is given besides the payload. */
+export interface Context {
+  /** What the sender attached to the frame. Empty when it attached nothing. */
+  meta: Meta
+}
+
+/** What a request handler is given besides the payload. */
+export interface HandlerContext extends Context {
   /** Aborts when the requester gives up. Streaming handlers must observe it. */
   signal: AbortSignal
 }
@@ -246,9 +269,15 @@ export type Handlers<T extends Spec, D extends Dir> = {
     ? (payload: T[K]['_q'], ctx: HandlerContext) => T[K]['_r'] | Promise<T[K]['_r']>
     : T[K]['mode'] extends 'many'
       ? (payload: T[K]['_q'], ctx: HandlerContext) => Streamed<T[K]['_r']> | Promise<Streamed<T[K]['_r']>>
-      : (payload: T[K]['_q']) => void
+      : (payload: T[K]['_q'], ctx: Context) => void
 }
 
-export interface CallOptions {
+/** What may be attached to any outbound message. */
+export interface SendOptions {
+  /** Rides along with the frame, untyped and unvalidated. */
+  meta?: Meta | undefined
+}
+
+export interface CallOptions extends SendOptions {
   signal?: AbortSignal | undefined
 }

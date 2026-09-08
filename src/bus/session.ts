@@ -1,6 +1,7 @@
 import { emitter, noop, queue, report, validateSync, type Emitter } from '../core/internal.ts'
-import type { Port, Unsub } from '../index.ts'
-import type { ILink } from './link/index.ts'
+import { detacher } from '../core/index.ts'
+import type { ListenOptions, Port, Unsub } from '../index.ts'
+import type { Link } from './link/index.ts'
 import * as Protocol from './protocol.ts'
 
 /**
@@ -35,7 +36,7 @@ export declare namespace Session {
     to?: string | undefined
   }
 
-  export interface StreamOptions extends Port.ListenOptions {
+  export interface StreamOptions extends ListenOptions {
     /** Payloads held while the consumer is slow. Oldest are dropped. Default 64. */
     buffer?: number | undefined
   }
@@ -44,7 +45,7 @@ export declare namespace Session {
    * A topic is a {@link Port}: hand it straight to `@lickle/wire/rpc` or
    * `@lickle/wire/replica`, no adapter needed.
    */
-  export interface Topic<S, R = S, TO extends string = string, FROM extends string = string> extends Port.Port<S, R> {
+  export interface Topic<S, R = S, TO extends string = string, FROM extends string = string> extends Port<S, R> {
     /** Channel this topic publishes to. */
     readonly to: TO
     /** Channel this topic listens on. Equal to `to` for a symmetric topic. */
@@ -60,9 +61,9 @@ export declare namespace Session {
      * Subscribes on the first listener, unsubscribes when the last one leaves.
      * `onClose` fires when the session ends.
      */
-    listen(fn: (payload: R, meta: MessageMeta) => void, opts?: Port.ListenOptions): Unsub
+    listen(fn: (payload: R, meta: MessageMeta) => void, opts?: ListenOptions): Unsub
     /** Detaches after the first payload. */
-    once(fn: (payload: R, meta: MessageMeta) => void, opts?: Port.ListenOptions): Unsub
+    once(fn: (payload: R, meta: MessageMeta) => void, opts?: ListenOptions): Unsub
     /** `for await (const p of topic.stream({ signal }))`. Ends when the session does. */
     stream(opts?: StreamOptions): AsyncIterableIterator<R>
     /**
@@ -70,7 +71,7 @@ export declare namespace Session {
      * `id` are delivered. One request/response conversation per peer, over a
      * channel everyone shares.
      */
-    peer(id: string): Port.Port<S, R>
+    peer(id: string): Port<S, R>
   }
 
   export type SessionEvent = 'open' | 'close' | 'error'
@@ -92,11 +93,11 @@ type Sink = (payload: unknown, meta: Session.MessageMeta) => void
 
 export class Session<
   T extends Protocol.Topics = Protocol.Topics,
-  L extends ILink<Protocol.Envelope> = ILink<Protocol.Envelope>,
+  L extends Link<Protocol.Envelope> = Link<Protocol.Envelope>,
 > {
   #listeners = new Map<string, Set<Sink>>()
   #topics = new Map<string, Session.Topic<never, never>>()
-  #stop: Unsub[] = []
+  #stop = detacher()
   #ready = false
   #closed = false
   #id: string | null = null
@@ -105,7 +106,7 @@ export class Session<
 
   static over = <
     T extends Protocol.Topics = Protocol.Topics,
-    L extends ILink<Protocol.Envelope> = ILink<Protocol.Envelope>,
+    L extends Link<Protocol.Envelope> = Link<Protocol.Envelope>,
   >(
     name: string,
     link: L,
@@ -133,19 +134,16 @@ export class Session<
     // `closed` is terminal on a link — a persistent one only fires it on
     // give-up or an explicit close — so the session ends with it. A transient
     // `up: false` is `#down`: intent is kept and replayed on the next `ready`.
-    this.#stop = [
-      link.listen((m) => this.#recv(m)),
+    // A dead link closes the session from inside the third line, before the
+    // first two have anywhere to be released to. The detacher absorbs that by
+    // running each teardown as it arrives once it has stopped.
+    this.#stop.add(link.listen((m) => this.#recv(m)))
+    this.#stop.add(
       link.changed((up) => {
         if (!up) this.#down()
       }),
-      link.closed(() => this.close()),
-    ]
-    // `closed` fired synchronously if the link was already dead; `close()` ran
-    // against the empty initial `#stop`, so release what was just attached.
-    if (this.#closed) {
-      for (const s of this.#stop) s()
-      this.#stop = []
-    }
+    )
+    this.#stop.add(link.closed(() => this.close()))
   }
 
   /** Peer id assigned by the hub. Changes on reconnect; null while down. */
@@ -171,7 +169,7 @@ export class Session<
    * `'close'` is the link going down, which a persistent link recovers from;
    * `opts.onClose` is the session ending, which nothing recovers from.
    */
-  on(event: Session.SessionEvent, fn: (err?: unknown) => void, opts: Port.ListenOptions = {}): Unsub {
+  on(event: Session.SessionEvent, fn: (err?: unknown) => void, opts: ListenOptions = {}): Unsub {
     if (this.#closed) {
       opts.onClose?.()
       return noop
@@ -184,7 +182,7 @@ export class Session<
   }
 
   /** Resolves on the next `open`, immediately if already connected. Rejects when the session ends. */
-  ready(opts: Port.ListenOptions = {}): Promise<void> {
+  ready(opts: ListenOptions = {}): Promise<void> {
     if (this.connected) return Promise.resolve()
     if (this.#closed) return Promise.reject(new Error(`session ${this.name} is closed`))
     return new Promise<void>((resolve, reject) => {
@@ -302,8 +300,7 @@ export class Session<
     this.#closed = true
     this.#ready = false
     this.#id = null
-    for (const s of this.#stop) s()
-    this.#stop = []
+    this.#stop.stop()
     this.#listeners.clear()
     this.#topics.clear()
     this.link.close()
@@ -312,7 +309,7 @@ export class Session<
     for (const e of Object.values(this.#events)) e.clear()
   }
 
-  #withEnd(off: Unsub, opts: Port.ListenOptions): Unsub {
+  #withEnd(off: Unsub, opts: ListenOptions): Unsub {
     const onClose = opts.onClose
     if (!onClose) return off
     const offEnd = this.#events.ended.add(() => onClose(), opts.signal)

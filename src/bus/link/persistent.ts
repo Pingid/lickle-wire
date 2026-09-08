@@ -1,10 +1,11 @@
-import { type Unsub, type Clock, systemClock } from '../../core/index.ts'
+import { detacher, systemClock, type Clock, type Unsub } from '../../core/index.ts'
 import { attempt, report } from '../../core/internal.ts'
-import { baseLink } from './base.ts'
+import { defineLink } from './base.ts'
+import { outbox } from './outbox.ts'
 
-import type { ILink } from './index.ts'
+import type { Link } from './index.ts'
 
-export interface Persistent<T> extends ILink<T> {
+export interface Persistent<T> extends Link<T> {
   readonly state: Persistent.State
   /** Consecutive failures since the last success. */
   readonly attempts: number
@@ -71,36 +72,26 @@ export declare namespace Persistent {
  * the other end, "we connected but nobody was there" is indistinguishable from
  * "we connected and it has been quiet", and every attempt looks like a failure.
  */
-/** Not public: one outbound message waiting for the link to come up. */
-type Held<T> = { msg: T; at: number }
-
-export const persistent = <T>(connector: ILink.Connector<T>, opts: Persistent.Options = {}): Persistent<T> => {
+export const persistent = <T>(connector: Link.Connector<T>, opts: Persistent.Options = {}): Persistent<T> => {
   const { base = 250, max = 30_000 } = opts.backoff ?? {}
   const clock = opts.clock ?? systemClock
-  const cap = opts.buffer ?? 64
-  const ttl = opts.ttl ?? 0
-  const overflow = opts.overflow ?? 'newest'
   const jitter = Math.min(Math.max(opts.jitter ?? 0, 0), 1)
   const timeout = opts.timeout ?? 10_000
   const limit = opts.maxAttempts ?? 0
 
-  const outbox: Held<T>[] = []
-  let inner: ILink<T> | null = null
+  const held = outbox<T>({ ...opts, clock, onDrop: opts.onDrop })
+  let inner: Link<T> | null = null
   let state: Persistent.State = 'connecting'
   let remote = ''
-  let meta: ILink.Meta = {}
+  let meta: Link.Meta = {}
   let fails = 0
   let epoch = 0
   let cancel: Unsub | null = null
   let detach: Unsub | null = null
 
-  const core = baseLink<T>({
-    describe: () => ({ remote, meta }),
-    pending: opts.pending,
-    up: () => state === 'open',
-    onError: opts.onError,
-    onDrop: (m) => opts.onDrop?.(m),
-  })
+  // Assigned by `defineLink` before anything below can run: `connect` is
+  // driven from inside `open`, which is the only caller that reaches it first.
+  let host!: Link.Host<T>
 
   const setState = (next: Persistent.State) => {
     if (next === state) return
@@ -108,22 +99,12 @@ export const persistent = <T>(connector: ILink.Connector<T>, opts: Persistent.Op
     state = next
     attempt(() => opts.onState?.(next), undefined, opts.onError)
     const is = next === 'open'
-    if (is !== was) core.signal(is)
-  }
-
-  const expire = () => {
-    if (ttl <= 0) return
-    const cutoff = clock.now() - ttl
-    while (outbox.length > 0 && (outbox[0] as Held<T>).at < cutoff) {
-      const stale = outbox.shift() as Held<T>
-      opts.onDrop?.(stale.msg)
-    }
+    if (is !== was) host.signal(is)
   }
 
   const flush = () => {
-    if (!inner) return
-    expire()
-    for (const held of outbox.splice(0)) if (!inner.send(held.msg)) opts.onDrop?.(held.msg)
+    const live = inner
+    if (live) held.drain((msg) => live.send(msg))
   }
 
   const giveUp = (err: unknown) => {
@@ -151,7 +132,7 @@ export const persistent = <T>(connector: ILink.Connector<T>, opts: Persistent.Op
     cancel = null
 
     const token = ++epoch
-    let link: ILink<T>
+    let link: Link<T>
     try {
       link = connector()
     } catch (err) {
@@ -165,11 +146,8 @@ export const persistent = <T>(connector: ILink.Connector<T>, opts: Persistent.Op
     meta = link.meta
     setState('connecting')
 
-    const stops: Unsub[] = []
-    const stop = () => {
-      for (const s of stops) s()
-      stops.length = 0
-    }
+    const stops = detacher()
+    const stop = stops.stop
     const dropped = () => {
       if (token !== epoch) return
       epoch += 1
@@ -189,7 +167,7 @@ export const persistent = <T>(connector: ILink.Connector<T>, opts: Persistent.Op
     }
 
     let cancelExpiry: Unsub | null = null
-    stops.push(
+    stops.add(
       link.listen((m) => {
         if (token !== epoch) return
         if (state !== 'open') {
@@ -199,16 +177,17 @@ export const persistent = <T>(connector: ILink.Connector<T>, opts: Persistent.Op
           setState('open')
           flush()
         }
-        core.deliver(m)
+        host.deliver(m)
       }),
     )
-    // `closed` may fire synchronously here if the connector handed back a dead
-    // link, which is why `dropped` is guarded by the attempt token.
-    stops.push(link.closed(dropped))
+    // `closed` fires synchronously here if the connector handed back a dead
+    // link. The detacher runs each teardown as it arrives once `stop` has
+    // already gone, and `dropped` is guarded by the attempt token.
+    stops.add(link.closed(dropped))
 
     if (timeout > 0) {
       cancelExpiry = clock.timer(expired, timeout)
-      stops.push(() => cancelExpiry?.())
+      stops.add(() => cancelExpiry?.())
     }
 
     if (token !== epoch) {
@@ -227,34 +206,39 @@ export const persistent = <T>(connector: ILink.Connector<T>, opts: Persistent.Op
     detach = null
     inner?.close()
     inner = null
-    for (const held of outbox.splice(0)) opts.onDrop?.(held.msg)
+    held.clear()
     setState('closed')
-    core.shut()
+    host.shut()
   }
 
-  connect()
-
-  const link = core.expose((msg) => {
-    if (state === 'closed') return false
-    if (state === 'open' && inner) return inner.send(msg)
-    if (cap <= 0) {
-      opts.onDrop?.(msg)
-      return false
-    }
-    expire()
-    if (outbox.length >= cap) {
-      if (overflow === 'newest') {
-        opts.onDrop?.(msg)
-        return false
+  const link = defineLink<T>(
+    (h) => {
+      host = h
+      // The first attempt runs here rather than before the link exists, so a
+      // connector that hands back a dead link — or throws — has somewhere to
+      // report it.
+      connect()
+      return {
+        send: (msg) => {
+          if (state === 'closed') return false
+          if (state === 'open' && inner) return inner.send(msg)
+          return held.hold(msg)
+        },
+        close,
       }
-      while (outbox.length >= cap) {
-        const oldest = outbox.shift() as Held<T>
-        opts.onDrop?.(oldest.msg)
-      }
-    }
-    outbox.push({ msg, at: clock.now() })
-    return true
-  }, close)
+    },
+    {
+      // Thunks: the far end changes under this link on every reconnect.
+      remote: () => remote,
+      meta: () => meta,
+      pending: opts.pending,
+      // A link that has not connected yet is alive and down, so the first
+      // `open` reads as a transition rather than a repeat `changed` swallows.
+      up: false,
+      onError: opts.onError,
+      onDrop: (m) => opts.onDrop?.(m),
+    },
+  )
 
   return {
     ...link,

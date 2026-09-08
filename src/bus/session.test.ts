@@ -1,8 +1,8 @@
 import { describe, expect, it, vi } from 'vitest'
 import * as Protocol from './protocol.ts'
 import { noop } from '../core/internal.ts'
-import { baseLink } from './link/base.ts'
-import { pair } from './link/index.ts'
+import { defineLink } from './link/base.ts'
+import { pair, type Link } from './link/index.ts'
 import { Session } from './session.ts'
 
 const { seal, VERSION, ProtocolError } = Protocol
@@ -37,13 +37,18 @@ const harness = (opts: Session.Options<Bus> = {}) => {
 /** A link whose `up` can be toggled without closing it — what `Link.persistent` does while retrying. */
 const stub = () => {
   const sent: Protocol.Envelope[] = []
-  const core = baseLink<Protocol.Envelope>({ describe: () => ({ remote: 'hub', meta: {} }) })
-  const link = core.expose(
-    (m) => {
-      sent.push(m)
-      return true
+  let core!: Link.Host<Protocol.Envelope>
+  const link = defineLink<Protocol.Envelope>(
+    (host) => {
+      core = host
+      return {
+        send: (m) => {
+          sent.push(m)
+          return true
+        },
+      }
     },
-    () => core.shut(),
+    { remote: 'hub' },
   )
   return { core, link, sent }
 }
@@ -249,6 +254,9 @@ describe('Session', () => {
     await settled()
     expect(outcome).toBe('pending')
 
+    // A real link signals up before the greeting it reconnected for arrives —
+    // `persistent` sets `open` from inside its own `listen`, ahead of `deliver`.
+    core.signal(true)
     core.deliver(seal('h', { t: 'ready', id: 'p2' }))
     await pending
     expect(outcome).toBe('resolved')

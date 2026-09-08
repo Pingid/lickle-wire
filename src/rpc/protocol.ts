@@ -1,5 +1,5 @@
 import { noop, queue, report } from '../core/internal.ts'
-import type { Port, Unsub } from '../core/index.ts'
+import type { ListenOptions, Port, Unsub } from '../core/index.ts'
 import { validateSync, type Validate } from '../core/validate.ts'
 import type {
   Api,
@@ -10,6 +10,7 @@ import type {
   Dir,
   HandlerContext,
   Handlers,
+  Meta,
   Mode,
   On,
   Re,
@@ -20,6 +21,7 @@ import type {
   Spec,
   Subscription,
   CallOptions,
+  Context,
 } from './spec.js'
 
 // ---------------------------------------------------------------------------
@@ -30,6 +32,9 @@ import type {
  * The framed representation. `_t` namespaces the protocol so unrelated traffic
  * on a shared transport is dropped rather than misread; `re` distinguishes a
  * response from a request.
+ *
+ * `meta` is the one open field: anything the two ends agree on rides there,
+ * untyped and unvalidated, and the key is absent when nothing was attached.
  */
 export interface Frame {
   _t: string
@@ -37,22 +42,39 @@ export interface Frame {
   id?: string | undefined
   re?: Re | undefined
   payload?: unknown
+  meta?: Meta | undefined
 }
 
 /**
  * How a message is framed onto the wire and read back off it.
  *
  * `decode` is written in continuation style so a codec can drop frames it does
- * not recognise — that is what lets several protocols share one transport.
+ * not recognise — that is what lets several protocols share one transport. The
+ * same continuation is how a layer contributes what it alone knows: whatever it
+ * passes `next` as a second argument joins the frame's own `meta`, and reaches
+ * every listener and handler as if the sender had put it there.
+ *
+ * Nothing is needed in the other direction — `encode` is handed the whole
+ * message, so a layer that wants to lift `meta` into its own envelope reads it
+ * off `msg.meta`.
  */
 export interface Codec<Wire, Inner = any> {
   encode: (msg: Inner) => Wire
-  decode: (frame: Wire, next: (msg: Inner) => void) => void
+  decode: (frame: Wire, next: (msg: Inner, meta?: Meta) => void) => void
 }
+
+/**
+ * Outer layers win. They have already been unwrapped and vouched for by the
+ * time an inner one runs, while the innermost thing of all is what the far side
+ * said about itself.
+ */
+const merge = (below: Meta | undefined, above: Meta | undefined): Meta | undefined =>
+  below === undefined ? above : above === undefined ? below : { ...below, ...above }
 
 const compose = (outer: Codec<any>, inner: Codec<any>): Codec<any> => ({
   encode: (msg) => outer.encode(inner.encode(msg)),
-  decode: (frame, next) => outer.decode(frame, (mid) => inner.decode(mid, next)),
+  decode: (frame, next) =>
+    outer.decode(frame, (mid, above) => inner.decode(mid, (msg, below) => next(msg, merge(below, above)))),
 })
 
 // ---------------------------------------------------------------------------
@@ -77,7 +99,7 @@ export interface Options {
  * One side of a protocol: a {@link Port} at the message level, plus the
  * generated call surface, per-message inbound listeners, and `serve`.
  */
-export type Sided<T extends Spec, D extends Dir> = Port.Port<SendMsg<T, D>, RecvMsg<T, D>> &
+export type Sided<T extends Spec, D extends Dir> = Port<SendMsg<T, D>, RecvMsg<T, D>> &
   Api<T, D> & {
     /** Per-message inbound listeners, carrying the means to respond. */
     on: On<T, D>
@@ -94,8 +116,8 @@ export type Peer<T extends Spec> = Sided<T, 'l'>
 export interface Protocol<T extends Spec, Wire = Frame> {
   readonly name: string
   readonly spec: T
-  left: (transport: Port.Port<Wire, Wire>) => Sided<T, 'l'>
-  right: (transport: Port.Port<Wire, Wire>) => Sided<T, 'r'>
+  left: (transport: Port<Wire, Wire>, codec?: Codec<any>) => Sided<T, 'l'>
+  right: (transport: Port<Wire, Wire>, codec?: Codec<any>) => Sided<T, 'r'>
   /** Re-frame through an outer codec. Composes; it does not replace. */
   with: <Outer>(codec: Codec<Outer, Wire>) => Protocol<T, Outer>
   /** Rename, so the same protocol can be mounted twice on one transport. */
@@ -135,7 +157,7 @@ export interface Channel<T extends Spec, Wire = Frame> {
   readonly name: string
   readonly spec: T
   /** Attach an instance. There is only one constructor because both ends are alike. */
-  connect: (transport: Port.Port<Wire, Wire>) => Peer<T>
+  connect: (transport: Port<Wire, Wire>) => Peer<T>
   /** Re-frame through an outer codec. Composes; it does not replace. */
   with: <Outer>(codec: Codec<Outer, Wire>) => Channel<T, Outer>
   /** Rename, so the same channel can be mounted twice on one transport. */
@@ -196,15 +218,17 @@ const build = <T extends Spec, W>(
   options: Options,
   outer: Codec<any> | null,
 ): Protocol<T, W> => {
-  const codecFor = (dir: Dir): Codec<any> => {
+  const codecFor = (dir: Dir, cod?: Codec<any>): Codec<any> => {
     const inner = specCodec(name, spec, dir, options)
-    return outer ? compose(outer, inner) : inner
+    const c1 = outer ? compose(outer, inner) : inner
+    return cod ? compose(cod, c1) : c1
   }
+
   return {
     name,
     spec,
-    left: (transport) => adapt(spec, 'l', codecFor('l'), transport as unknown as Port.Port<Frame, Frame>, options),
-    right: (transport) => adapt(spec, 'r', codecFor('r'), transport as unknown as Port.Port<Frame, Frame>, options),
+    left: (transport, c) => adapt(spec, 'l', codecFor('l', c), transport as unknown as Port<Frame, Frame>, options),
+    right: (transport, c) => adapt(spec, 'r', codecFor('r', c), transport as unknown as Port<Frame, Frame>, options),
     with: <Outer>(codec: Codec<Outer, W>) =>
       build<T, Outer>(name, spec, options, outer ? compose(codec, outer) : codec),
     at: (renamed) => build<T, W>(renamed, spec, options, outer),
@@ -244,6 +268,9 @@ const specCodec = (name: string, spec: Spec, side: Dir, options: Options): Codec
       const { _t, ...msg } = frame
       const d: Desc | undefined = spec[frame.kind]
       if (!d) return reject(`unknown message: ${String(frame.kind)}`, frame)
+      // Meta is framing rather than payload, so its shape is checked here even
+      // though its contents never are.
+      if (frame.meta !== undefined && !isMeta(frame.meta)) return reject(`${frame.kind}: meta must be an object`, frame)
 
       // A request or a cancellation travels from originator to responder, so
       // the far side must be allowed to originate this message.
@@ -300,10 +327,25 @@ const closedError = (kind: string, error: unknown) =>
 // Side adapter
 // ---------------------------------------------------------------------------
 
-type AnyMsg = { kind: string; id?: string | undefined; re?: Re | undefined; payload?: unknown }
+type AnyMsg = {
+  kind: string
+  id?: string | undefined
+  re?: Re | undefined
+  payload?: unknown
+  meta?: Meta | undefined
+}
 type Pending = { kind: string; handle: (msg: AnyMsg) => void; close: (error?: unknown) => void }
-type Listener = { sink: (value: unknown) => void; onClose: ((error?: unknown) => void) | undefined }
+type Listener = { sink: (value: unknown, meta: Meta) => void; onClose: ((error?: unknown) => void) | undefined }
 type Handler = (payload: unknown, ctx: HandlerContext) => unknown
+
+const isMeta = (v: unknown): v is Meta => typeof v === 'object' && v !== null && !Array.isArray(v)
+
+/** Frames carry `meta` only when there is some, so a protocol that never sets it is unchanged. */
+const stamp = (msg: AnyMsg, meta: Meta | undefined): AnyMsg => (meta === undefined ? msg : { ...msg, meta })
+
+/** What a codec contributed lands on the message itself, so a raw listener sees what `on.X` sees. */
+const enrich = (msg: AnyMsg, meta: Meta | undefined): AnyMsg =>
+  meta === undefined ? msg : { ...msg, meta: { ...msg.meta, ...meta } }
 
 const SEP = String.fromCharCode(0)
 const key = (kind: string, id: string) => `${kind}${SEP}${id}`
@@ -311,13 +353,17 @@ const key = (kind: string, id: string) => `${kind}${SEP}${id}`
 /**
  * `Args<Q>` is erased, so a lone argument is ambiguous between a payload and
  * `CallOptions`. The one thing a payload can never carry across a wire is a
- * live `AbortSignal`, so that is the discriminator.
+ * live `AbortSignal`, so that is the first discriminator. Meta-only options
+ * carry no signal, so they are recognised structurally instead: an object whose
+ * every key is an option name, with a `meta` on it. A payload that genuinely
+ * looks like that is sent by passing the options explicitly — `f(payload, {})`.
  */
-const isOpts = (v: unknown): v is CallOptions =>
-  typeof v === 'object' &&
-  v !== null &&
-  typeof AbortSignal !== 'undefined' &&
-  (v as CallOptions).signal instanceof AbortSignal
+const isOpts = (v: unknown): v is CallOptions => {
+  if (typeof v !== 'object' || v === null) return false
+  const o = v as CallOptions
+  if (typeof AbortSignal !== 'undefined' && o.signal instanceof AbortSignal) return true
+  return o.signal === undefined && isMeta(o.meta) && Object.keys(o).every((k) => k === 'meta' || k === 'signal')
+}
 
 const split = (args: unknown[]): [payload: unknown, opts: CallOptions | undefined] =>
   args.length >= 2
@@ -330,7 +376,7 @@ const adapt = <T extends Spec, D extends Dir>(
   spec: T,
   side: D,
   codec: Codec<any>,
-  transport: Port.Port<Frame, Frame>,
+  transport: Port<Frame, Frame>,
   options: Options,
 ): Sided<T, D> => {
   const send = (msg: AnyMsg) => transport.send(codec.encode(msg))
@@ -359,7 +405,9 @@ const adapt = <T extends Spec, D extends Dir>(
     // A link flushes buffered inbound — and reports an already-closed port —
     // synchronously inside `listen`, so nothing may assume `off` is set until
     // this returns.
-    const u = transport.listen((frame) => codec.decode(frame, (m) => dispatch(m as AnyMsg)), { onClose: shutdown })
+    const u = transport.listen((frame) => codec.decode(frame, (m, meta) => dispatch(enrich(m as AnyMsg, meta))), {
+      onClose: shutdown,
+    })
     attaching = false
     if (users === 0 || closed) u()
     else off = u
@@ -383,9 +431,9 @@ const adapt = <T extends Spec, D extends Dir>(
 
   // -- inbound ---------------------------------------------------------------
 
-  const fire = (l: Listener, value: unknown) => {
+  const fire = (l: Listener, value: unknown, meta: Meta) => {
     try {
-      l.sink(value)
+      l.sink(value, meta)
     } catch (err) {
       // One bad listener never starves the rest.
       report(err, options.onError)
@@ -395,14 +443,17 @@ const adapt = <T extends Spec, D extends Dir>(
   // Runs inside the transport's own delivery callback, so a rejected frame
   // throws where it arrived — which is what `onInvalid: 'throw'` promises.
   const dispatch = (msg: AnyMsg) => {
-    for (const l of [...raw]) fire(l, msg)
+    // One meta object per frame, so every listener sees the same thing whether
+    // or not the sender attached anything.
+    const meta = msg.meta ?? {}
+    for (const l of [...raw]) fire(l, msg, meta)
     if (msg.re === undefined) {
       const set = listeners.get(msg.kind)
       const d = spec[msg.kind]
       if (!set || set.size === 0 || !d) return
       // One Call/Subscription per frame, shared by every listener.
-      const inc = wrap(msg.kind, d.mode, msg)
-      for (const l of [...set]) fire(l, inc)
+      const inc = wrap(msg.kind, d.mode, msg, meta)
+      for (const l of [...set]) fire(l, inc, meta)
       return
     }
     if (msg.id === undefined) return
@@ -436,8 +487,8 @@ const adapt = <T extends Spec, D extends Dir>(
 
   const subscribe = (
     set: Set<Listener>,
-    sink: (v: unknown) => void,
-    opts: Port.ListenOptions,
+    sink: (v: unknown, meta: Meta) => void,
+    opts: ListenOptions,
     onEmpty?: () => void,
   ): Unsub => {
     if (opts.signal?.aborted) return noop
@@ -463,7 +514,7 @@ const adapt = <T extends Spec, D extends Dir>(
 
   const on =
     (kind: string) =>
-    (fn: (incoming: unknown) => void, opts: Port.ListenOptions = {}): Unsub => {
+    (fn: (incoming: unknown, meta: Meta) => void, opts: ListenOptions = {}): Unsub => {
       let set = listeners.get(kind)
       if (!set) listeners.set(kind, (set = new Set()))
       const mine = set
@@ -472,10 +523,10 @@ const adapt = <T extends Spec, D extends Dir>(
       })
     }
 
-  const listen = (next: (value: unknown) => void, opts: Port.ListenOptions = {}): Unsub => subscribe(raw, next, opts)
+  const listen = (next: (value: unknown) => void, opts: ListenOptions = {}): Unsub => subscribe(raw, next, opts)
 
   /** Build what an `on.X` listener receives: the payload, and for requests the means to answer. */
-  const wrap = (kind: string, mode: Mode, msg: AnyMsg): unknown => {
+  const wrap = (kind: string, mode: Mode, msg: AnyMsg, meta: Meta): unknown => {
     if (mode === 'none') return msg.payload
     const id = msg.id as string // the codec guaranteed it
     const k = key(kind, id)
@@ -494,28 +545,30 @@ const adapt = <T extends Spec, D extends Dir>(
       finish()
       ac.abort(reason)
     })
-    const reply = (frame: { re: Re; payload?: unknown }) => {
+    const reply = (frame: { re: Re; payload?: unknown }, out?: Meta) => {
       if (!open) return
       finish()
-      send({ kind, id, ...frame })
+      send(stamp({ kind, id, ...frame }, out))
     }
-    const fail = (e: unknown) => reply({ re: 'err', payload: toWire(e) })
+    const fail = (e: unknown, out?: Meta) => reply({ re: 'err', payload: toWire(e) }, out)
     if (mode === 'one') {
       const call: Call<unknown, unknown> = {
         payload: msg.payload,
+        meta,
         signal: ac.signal,
-        respond: (value) => reply({ re: 'ok', payload: value }),
+        respond: (value, out) => reply({ re: 'ok', payload: value }, out),
         fail,
       }
       return call
     }
     const sub: Subscription<unknown, unknown> = {
       payload: msg.payload,
+      meta,
       signal: ac.signal,
-      next: (value) => {
-        if (open) send({ kind, id, re: 'next', payload: value })
+      next: (value, out) => {
+        if (open) send(stamp({ kind, id, re: 'next', payload: value }, out))
       },
-      end: () => reply({ re: 'end' }),
+      end: (out) => reply({ re: 'end' }, out),
       fail,
     }
     return sub
@@ -523,7 +576,12 @@ const adapt = <T extends Spec, D extends Dir>(
 
   // -- outbound --------------------------------------------------------------
 
-  const notify = (kind: string) => (payload?: unknown) => send({ kind, payload })
+  const notify =
+    (kind: string) =>
+    (...args: unknown[]) => {
+      const [payload, opts] = split(args)
+      send(stamp({ kind, payload }, opts?.meta))
+    }
 
   const call =
     (kind: string) =>
@@ -574,7 +632,7 @@ const adapt = <T extends Spec, D extends Dir>(
         }
         signal?.addEventListener('abort', onAbort, { once: true })
         try {
-          send({ kind, payload, id })
+          send(stamp({ kind, payload, id }, opts?.meta))
         } catch (e) {
           // e.g. a DataCloneError from a raw postMessage port
           settle(() => reject(e))
@@ -653,7 +711,7 @@ const adapt = <T extends Spec, D extends Dir>(
         }
         signal?.addEventListener('abort', onAbort, { once: true })
         try {
-          send({ kind, payload, id })
+          send(stamp({ kind, payload, id }, opts?.meta))
         } catch (e) {
           teardown()
           q.fail(e)
@@ -694,8 +752,8 @@ const adapt = <T extends Spec, D extends Dir>(
       const mode = (spec[kind] as Desc).mode
       const h = handler as Handler
       offs.push(
-        on(kind)((inc) => {
-          if (mode === 'none') (h as (payload: unknown) => void)(inc)
+        on(kind)((inc, meta) => {
+          if (mode === 'none') (h as (payload: unknown, ctx: Context) => void)(inc, { meta })
           else if (mode === 'one') void answer(inc as Call<unknown, unknown>, h)
           else void pump(inc as Subscription<unknown, unknown>, h)
         }),
@@ -717,7 +775,7 @@ const adapt = <T extends Spec, D extends Dir>(
 const answer = async (inc: Call<unknown, unknown>, handler: Handler) => {
   if (inc.signal.aborted) return
   try {
-    inc.respond(await handler(inc.payload, { signal: inc.signal }))
+    inc.respond(await handler(inc.payload, { signal: inc.signal, meta: inc.meta }))
   } catch (e) {
     inc.fail(e)
   }
@@ -762,7 +820,7 @@ const pump = async (inc: Subscription<unknown, unknown>, handler: Handler) => {
   if (inc.signal.aborted) return
   let source: unknown
   try {
-    source = await handler(inc.payload, { signal: inc.signal })
+    source = await handler(inc.payload, { signal: inc.signal, meta: inc.meta })
   } catch (e) {
     if (!inc.signal.aborted) inc.fail(e)
     return
@@ -864,7 +922,7 @@ export type Mounted<Ps extends Record<string, Mountable>, D extends Dir> = {
 }
 
 /** A channel has one end, so `left` and `right` hand back the same thing. */
-const instance = (p: Mountable, side: 'left' | 'right', transport: Port.Port<any, any>) =>
+const instance = (p: Mountable, side: 'left' | 'right', transport: Port<any, any>) =>
   'connect' in p ? p.connect(transport) : p[side](transport)
 
 /**
@@ -880,11 +938,11 @@ const instance = (p: Mountable, side: 'left' | 'right', transport: Port.Port<any
  * ```
  */
 export const mount = <Ps extends Record<string, Mountable>>(protocols: Ps) => ({
-  left: (transport: Port.Port<any, any>) =>
+  left: (transport: Port<any, any>) =>
     Object.fromEntries(
       Object.entries(protocols).map(([k, p]) => [k, instance(p, 'left', transport)]),
     ) as unknown as Mounted<Ps, 'l'>,
-  right: (transport: Port.Port<any, any>) =>
+  right: (transport: Port<any, any>) =>
     Object.fromEntries(
       Object.entries(protocols).map(([k, p]) => [k, instance(p, 'right', transport)]),
     ) as unknown as Mounted<Ps, 'r'>,

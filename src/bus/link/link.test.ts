@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { pair, persistent, type ILink, type Persistent } from './index.ts'
+import { pair, persistent, type Link, type Persistent } from './index.ts'
 import { fakeClock } from '../testing.js'
 
 // --- harness ----------------------------------------------------------------
@@ -8,7 +8,7 @@ import { fakeClock } from '../testing.js'
 const settled = () => new Promise<void>((r) => setTimeout(r, 0))
 
 /** Everything a link delivers from now on (and anything it had buffered). */
-const collect = <T>(link: ILink<T>) => {
+const collect = <T>(link: Link<T>) => {
   const seen: T[] = []
   link.listen((m) => seen.push(m))
   return seen
@@ -227,11 +227,11 @@ describe('persistent()', () => {
    */
   const rig = (opts: Persistent.Options = {}) => {
     const clock = fakeClock()
-    const links: ILink<string>[] = []
+    const links: Link<string>[] = []
     const onState = vi.fn<(state: Persistent.State) => void>()
     const onError = vi.fn<(err: unknown) => void>()
     const onDrop = vi.fn<(msg: unknown) => void>()
-    const connector = vi.fn((): ILink<string> => {
+    const connector = vi.fn((): Link<string> => {
       const n = links.length + 1
       const [client, server] = pair<string>('client', `server#${n}`, { metaB: { n } })
       links.push(server)
@@ -247,7 +247,7 @@ describe('persistent()', () => {
       onError,
       onDrop,
       /** The server end of the current attempt. */
-      server: () => links.at(-1) as ILink<string>,
+      server: () => links.at(-1) as Link<string>,
       /** The server speaks first — that unprompted greeting is what flips the link open. */
       greet: async (msg = 'ready') => {
         links.at(-1)?.send(msg)
@@ -407,14 +407,14 @@ describe('persistent()', () => {
   // behaviour without it. Skipped rather than `it.fails` because they hang.
   it("sheds the oldest message with overflow: 'oldest' even without onDrop", async () => {
     const clock = fakeClock()
-    const links: ILink<string>[] = []
-    const connector = (): ILink<string> => {
+    const links: Link<string>[] = []
+    const connector = (): Link<string> => {
       const [client, server] = pair<string>()
       links.push(server)
       return client
     }
     const link = persistent<string>(connector, { clock, jitter: 0, buffer: 2, overflow: 'oldest' })
-    const got = collect(links[0] as ILink<string>)
+    const got = collect(links[0] as Link<string>)
     expect(link.send('a')).toBe(true)
     expect(link.send('b')).toBe(true)
     expect(link.send('c')).toBe(true)
@@ -425,14 +425,14 @@ describe('persistent()', () => {
 
   it('drops buffered messages older than ttl even without onDrop', async () => {
     const clock = fakeClock()
-    const links: ILink<string>[] = []
-    const connector = (): ILink<string> => {
+    const links: Link<string>[] = []
+    const connector = (): Link<string> => {
       const [client, server] = pair<string>()
       links.push(server)
       return client
     }
     const link = persistent<string>(connector, { clock, jitter: 0, timeout: 0, ttl: 1000 })
-    const got = collect(links[0] as ILink<string>)
+    const got = collect(links[0] as Link<string>)
     link.send('old')
     clock.advance(1500)
     expect(link.send('new')).toBe(true)
@@ -446,9 +446,9 @@ describe('persistent()', () => {
     const onError = vi.fn<(err: unknown) => void>()
     const onState = vi.fn<(state: Persistent.State) => void>()
     const boom = new Error('no runtime')
-    const links: ILink<string>[] = []
+    const links: Link<string>[] = []
     let calls = 0
-    const connector = (): ILink<string> => {
+    const connector = (): Link<string> => {
       if (++calls === 1) throw boom
       const [client, server] = pair<string>()
       links.push(server)
@@ -469,8 +469,8 @@ describe('persistent()', () => {
   it('treats a connector that returns an already-closed link as a failed attempt', () => {
     const clock = fakeClock()
     const onState = vi.fn<(state: Persistent.State) => void>()
-    const links: ILink<string>[] = []
-    const connector = vi.fn((): ILink<string> => {
+    const links: Link<string>[] = []
+    const connector = vi.fn((): Link<string> => {
       const [client, server] = pair<string>()
       links.push(server)
       if (links.length === 1) client.close()

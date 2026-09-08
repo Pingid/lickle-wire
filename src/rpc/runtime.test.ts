@@ -6,24 +6,25 @@ import {
   send,
   symmetric,
   type Frame,
+  type Meta,
   type Source,
   type Subscription,
   type Validate,
 } from './index.js'
-import { Hub, pair as linkPair, type ILink, type Pair, type Port } from '../index.js'
+import { Hub, pair as linkPair, type Link, type ListenOptions, type Pair, type Port } from '../index.js'
 import { describe, expect, it, vi } from 'vitest'
 
 // --- harness ----------------------------------------------------------------
 
 /** Counts live `listen` calls on a port — the single-listener invariant made visible. */
-const probe = <S, R>(port: Port.Port<S, R>) => {
+const probe = <S, R>(port: Port<S, R>) => {
   let count = 0
   return {
     get count() {
       return count
     },
     send: (v: S) => port.send(v),
-    listen: (next: (v: R) => void, opts: Port.ListenOptions = {}) => {
+    listen: (next: (v: R) => void, opts: ListenOptions = {}) => {
       count++
       let done = false
       const leave = () => {
@@ -53,7 +54,7 @@ const wire = (opts?: Pair.Options) => {
 }
 
 /** Every frame one raw end sees, decoded by nobody. */
-const spy = (link: ILink<Frame>) => {
+const spy = (link: Link<Frame>) => {
   const seen: Frame[] = []
   link.listen((f) => seen.push(f))
   return seen
@@ -82,7 +83,7 @@ const manual = <T>() => {
     send: (v: T) => {
       sent.push(v)
     },
-    listen: (next: (v: T) => void, opts: Port.ListenOptions = {}) => {
+    listen: (next: (v: T) => void, opts: ListenOptions = {}) => {
       if (closed) {
         opts.onClose?.(closed.error)
         return () => {}
@@ -748,6 +749,213 @@ describe('on.X raw API', () => {
     expect(got).toEqual([2])
     await settled()
     expect(toLeft.filter((f) => f.re === 'next').map((f) => f.payload)).toEqual([2])
+  })
+})
+
+describe('meta', () => {
+  it('rides along with a notification and reaches the listener', async () => {
+    const t = wire()
+    const l = api.left(t.a)
+    const r = api.right(t.b)
+    const toRight = spy(t.rawB)
+    const seen: [string, Meta][] = []
+    r.on.log((s, meta) => seen.push([s, meta]))
+
+    l.log('hello', { meta: { trace: 't1' } })
+    await settled()
+
+    expect(seen).toEqual([['hello', { trace: 't1' }]])
+    expect(toRight[0]).toMatchObject({ kind: 'log', payload: 'hello', meta: { trace: 't1' } })
+  })
+
+  it('leaves the frame untouched when nothing is attached, and hands the listener an empty bag', async () => {
+    const t = wire()
+    const l = api.left(t.a)
+    const r = api.right(t.b)
+    const toRight = spy(t.rawB)
+    const seen: Meta[] = []
+    r.on.log((_s, meta) => seen.push(meta))
+
+    l.log('hello')
+    await settled()
+
+    expect(seen).toEqual([{}])
+    expect('meta' in toRight[0]!).toBe(false)
+  })
+
+  it('is the lone argument on a message that takes no payload', async () => {
+    const t = wire()
+    const l = api.left(t.a)
+    const r = api.right(t.b)
+    const seen: Meta[] = []
+    r.on.ready((_p, meta) => seen.push(meta))
+
+    l.ready({ meta: { n: 1 } })
+    l.ready()
+    await settled()
+
+    expect(seen).toEqual([{ n: 1 }, {}])
+  })
+
+  it('reaches every kind of served handler through ctx', async () => {
+    const t = wire()
+    const l = api.left(t.a)
+    const r = api.right(t.b)
+    const notes: Meta[] = []
+    let asked: Meta | undefined
+    let watched: Meta | undefined
+    r.serve({
+      log: (_s, ctx) => notes.push(ctx.meta),
+      getUser: ({ id }, ctx) => {
+        asked = ctx.meta
+        return { id, name: 'x' }
+      },
+      watch: (_q, ctx) => {
+        watched = ctx.meta
+        return [1, 2]
+      },
+    })
+
+    l.log('x', { meta: { a: 1 } })
+    expect(await l.getUser({ id: '1' }, { meta: { b: 2 } })).toEqual({ id: '1', name: 'x' })
+    const got: number[] = []
+    for await (const n of l.watch({ q: 'y' }, { meta: { c: 3 } })) got.push(n)
+    await settled()
+
+    expect(notes).toEqual([{ a: 1 }])
+    expect(asked).toEqual({ b: 2 })
+    expect(watched).toEqual({ c: 3 })
+    expect(got).toEqual([1, 2])
+  })
+
+  it('travels back on a response, where a raw listener reads it', async () => {
+    const t = wire()
+    const l = api.left(t.a)
+    const r = api.right(t.b)
+    const replies: (Meta | undefined)[] = []
+    const off = l.listen((m) => {
+      if (m.re !== undefined && m.re !== 'stop') replies.push(m.meta)
+    })
+    r.on.getUser(({ payload, respond }) => respond({ id: payload.id, name: 'x' }, { ms: 3 }))
+    r.on.watch(({ next, end }) => {
+      next(1, { i: 0 })
+      next(2, { i: 1 })
+      end({ total: 2 })
+    })
+    r.on.boom(({ fail }) => fail(new Error('nope'), { retry: false }))
+
+    expect(await l.getUser({ id: '1' })).toEqual({ id: '1', name: 'x' })
+    const got: number[] = []
+    for await (const n of l.watch({ q: 'y' })) got.push(n)
+    await expect(l.boom()).rejects.toThrow('nope')
+    await settled()
+    off()
+
+    expect(got).toEqual([1, 2])
+    expect(replies).toEqual([{ ms: 3 }, { i: 0 }, { i: 1 }, { total: 2 }, { retry: false }])
+  })
+
+  it('rides through a `signal` alongside it, and through an outer codec', async () => {
+    const t = wire()
+    const json = api.with<Frame>({
+      encode: (m) => JSON.parse(JSON.stringify(m)) as Frame,
+      decode: (f, next) => next(f),
+    })
+    const l = json.left(t.a)
+    const r = json.right(t.b)
+    let asked: Meta | undefined
+    r.serve({ getUser: ({ id }, ctx) => ((asked = ctx.meta), { id, name: 'x' }) })
+
+    const ac = new AbortController()
+    await l.getUser({ id: '1' }, { meta: { trace: 't' }, signal: ac.signal })
+
+    expect(asked).toEqual({ trace: 't' })
+  })
+
+  it('a codec contributes meta of its own through `next`', async () => {
+    type Env = { hop: string; frame: Frame }
+    const enveloped = api.with<Env>({
+      encode: (frame) => ({ hop: 'edge', frame }),
+      decode: (env, next) => next(env.frame, { hop: env.hop }),
+    })
+    const [pa, pb] = linkPair<Env>()
+    const l = enveloped.left(pa)
+    const r = enveloped.right(pb)
+
+    const seen: Meta[] = []
+    r.on.log((_s, meta) => seen.push(meta))
+    let asked: Meta | undefined
+    r.serve({
+      getUser: ({ id }, ctx) => {
+        asked = ctx.meta
+        return { id, name: 'x' }
+      },
+    })
+
+    l.log('hi', { meta: { trace: 't' } })
+    expect(await l.getUser({ id: '1' })).toEqual({ id: '1', name: 'x' })
+    await settled()
+
+    // What the sender attached and what the layer knew, in one bag.
+    expect(seen).toEqual([{ trace: 't', hop: 'edge' }])
+    expect(asked).toEqual({ hop: 'edge' })
+    pa.close()
+  })
+
+  it('composed codecs merge what each contributes, the outermost winning', async () => {
+    type Mid = { v: 1; frame: Frame }
+    type Out = { hop: string; body: Mid }
+    const layered = api
+      .with<Mid>({
+        encode: (frame) => ({ v: 1, frame }),
+        decode: (m, next) => next(m.frame, { hop: 'inner', layer: 'inner' }),
+      })
+      .with<Out>({
+        encode: (mid) => ({ hop: 'edge', body: mid }),
+        decode: (o, next) => next(o.body, { hop: o.hop }),
+      })
+    const [pa, pb] = linkPair<Out>()
+    const l = layered.left(pa)
+    const r = layered.right(pb)
+
+    const seen: Meta[] = []
+    r.on.log((_s, meta) => seen.push(meta))
+
+    // The far side claims a `hop` of its own; both layers outrank it.
+    l.log('hi', { meta: { hop: 'spoofed', trace: 't' } })
+    await settled()
+
+    expect(seen).toEqual([{ trace: 't', layer: 'inner', hop: 'edge' }])
+    pa.close()
+  })
+
+  it('a payload shaped like options is disambiguated by passing the options', async () => {
+    const t = wire()
+    const l = api.left(t.a)
+    const r = api.right(t.b)
+    r.on.echo(({ payload, respond }) => respond(payload))
+
+    // Bare, the lone `{ meta }` object is read as options — the documented cost
+    // of an erased payload type.
+    expect(await l.echo({ meta: { a: 1 } })).toBeUndefined()
+    // Spelled out, it is the payload.
+    expect(await l.echo({ meta: { a: 1 } }, {})).toEqual({ meta: { a: 1 } })
+  })
+
+  it('rejects a frame whose meta is not a bag of keys', async () => {
+    const errors: unknown[] = []
+    const t = wire({ onError: (e) => errors.push(e) })
+    const strict = pair('v', { log: send(stringSchema) })
+    const r = strict.right(t.b)
+    const seen: unknown[] = []
+    r.on.log((x) => seen.push(x))
+
+    t.rawA.send({ _t: 'v', kind: 'log', payload: 'x', meta: 7 } as unknown as Frame)
+    t.rawA.send({ _t: 'v', kind: 'log', payload: 'fine' })
+    await settled()
+
+    expect(errors.map((e) => (e as Error).message)).toEqual(['[v] log: meta must be an object'])
+    expect(seen).toEqual(['fine'])
   })
 })
 

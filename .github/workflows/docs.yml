@@ -27,7 +27,7 @@ jobs:
       - name: install
         run: pnpm install
       - name: typedoc
-        run: pnpm run docs:build --static --base "lickle-wire"
+        run: pnpm run docs:build --static --base "${{ github.event.repository.name }}"
       - uses: actions/configure-pages@v6
       - uses: actions/upload-pages-artifact@v5
         with:
